@@ -44,6 +44,31 @@ class FakeOnnxSession:
         return [token_embeddings]
 
 
+class RowNumberingOnnxSession:
+    """Returns a distinct embedding per row so batch splitting and ordering are verifiable.
+
+    Row *n* (counted across the whole run, not per batch) gets token embeddings
+    ``[[n, 0], [0, 0], [100, 100]]``; with ``FakeTokenizer``'s ``[1, 1, 0]`` mask,
+    mean pooling yields ``[n / 2, 0]``.
+    """
+
+    def __init__(self):
+        self.batch_sizes: list[int] = []
+        self._next_row = 1.0
+
+    def get_inputs(self):
+        return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="attention_mask")]
+
+    def run(self, output_names, inputs):
+        batch = inputs["input_ids"].shape[0]
+        self.batch_sizes.append(batch)
+        rows = []
+        for _ in range(batch):
+            rows.append([[self._next_row, 0.0], [0.0, 0.0], [100.0, 100.0]])
+            self._next_row += 1.0
+        return [np.array(rows, dtype=np.float32)]
+
+
 class FakePooledOnnxSession:
     def get_inputs(self):
         return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="attention_mask")]
@@ -102,6 +127,60 @@ def test_onnx_embeddings_rejects_invalid_pooling_before_initialize():
         OnnxEmbeddings(model_id="intfloat/multilingual-e5-small", pooling="max")
 
 
+def test_onnx_embeddings_rejects_non_positive_batch_size():
+    with pytest.raises(ValueError, match="batch_size"):
+        OnnxEmbeddings(model_id="intfloat/multilingual-e5-small", batch_size=0)
+
+
+def test_onnx_embeddings_splits_into_batches_preserving_order():
+    """Texts must be encoded in ``batch_size`` chunks, in order, with none dropped.
+
+    An unbatched pass pads every row to the longest sequence in the whole list,
+    so a large retain allocates one huge tensor and ratchets ONNX Runtime's RSS
+    up permanently.
+    """
+    session = RowNumberingOnnxSession()
+    emb = OnnxEmbeddings(
+        model_id="intfloat/multilingual-e5-small",
+        dimensions=2,
+        normalize=False,
+        batch_size=2,
+    )
+    emb._tokenizer = FakeTokenizer()
+    emb._session = session
+    emb._dimension = 2
+
+    result = emb.encode(["a", "b", "c", "d", "e"])
+
+    assert session.batch_sizes == [2, 2, 1]
+    assert emb._tokenizer.calls[0]["texts"] == ["a", "b"]
+    assert emb._tokenizer.calls[-1]["texts"] == ["e"]
+    assert result == [
+        pytest.approx([0.5, 0.0]),
+        pytest.approx([1.0, 0.0]),
+        pytest.approx([1.5, 0.0]),
+        pytest.approx([2.0, 0.0]),
+        pytest.approx([2.5, 0.0]),
+    ]
+
+
+def test_onnx_embeddings_batching_matches_single_pass_result():
+    """Batching must not change the vectors — pooling masks padding out either way."""
+
+    def encode_with(batch_size: int) -> list[list[float]]:
+        emb = OnnxEmbeddings(
+            model_id="intfloat/multilingual-e5-small",
+            dimensions=2,
+            batch_size=batch_size,
+        )
+        emb._tokenizer = FakeTokenizer()
+        emb._session = FakeOnnxSession()
+        emb._dimension = 2
+        return emb.encode(["a", "b", "c"])
+
+    assert encode_with(1) == encode_with(1000)
+
+
 def test_onnx_embeddings_warns_when_local_model_path_has_no_tokenizer(caplog):
     emb = OnnxEmbeddings(
         model_id="intfloat/multilingual-e5-small",
@@ -142,7 +221,10 @@ async def test_onnx_embeddings_dimension_mismatch_raises_value_error():
     fake_transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=FakeTokenizer()))
     )
-    fake_onnxruntime = SimpleNamespace(InferenceSession=MagicMock(return_value=FakeOnnxSession()))
+    fake_onnxruntime = SimpleNamespace(
+        InferenceSession=MagicMock(return_value=FakeOnnxSession()),
+        SessionOptions=SimpleNamespace,
+    )
 
     with patch.dict(sys.modules, {"transformers": fake_transformers, "onnxruntime": fake_onnxruntime}):
         with pytest.raises(ValueError, match="does not match model output"):
@@ -158,7 +240,7 @@ async def test_onnx_embeddings_downloads_external_data_sidecar_when_needed():
     fake_transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=FakeTokenizer()))
     )
-    fake_onnxruntime = SimpleNamespace(InferenceSession=session)
+    fake_onnxruntime = SimpleNamespace(InferenceSession=session, SessionOptions=SimpleNamespace)
 
     with patch.dict(
         sys.modules,
@@ -174,7 +256,33 @@ async def test_onnx_embeddings_downloads_external_data_sidecar_when_needed():
         repo_id="BAAI/bge-m3",
         allow_patterns=["onnx/model.onnx", "onnx/model.onnx_data"],
     )
-    session.assert_called_once_with("/hf/bge-m3/onnx/model.onnx", providers=["CPUExecutionProvider"])
+    assert session.call_args.args == ("/hf/bge-m3/onnx/model.onnx",)
+    assert session.call_args.kwargs["providers"] == ["CPUExecutionProvider"]
+
+
+@pytest.mark.asyncio
+async def test_onnx_embeddings_disables_cpu_mem_arena():
+    """The ONNX CPU arena never returns memory to the OS, so it must stay off.
+
+    With it enabled, one oversized batch raises RSS for the life of the process
+    — the reranker disables it for the same reason (see ``cross_encoder.py``).
+    """
+    emb = OnnxEmbeddings(
+        model_id="intfloat/multilingual-e5-small",
+        model_path="/models/e5/onnx/model.onnx",
+        tokenizer_name_or_path="/models/e5",
+        dimensions=2,
+    )
+    session = MagicMock(return_value=FakeOnnxSession())
+    fake_transformers = SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=FakeTokenizer()))
+    )
+    fake_onnxruntime = SimpleNamespace(InferenceSession=session, SessionOptions=SimpleNamespace)
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers, "onnxruntime": fake_onnxruntime}):
+        await emb.initialize()
+
+    assert session.call_args.kwargs["sess_options"].enable_cpu_mem_arena is False
 
 
 def test_create_embeddings_from_env_supports_onnx_provider():

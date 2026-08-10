@@ -307,6 +307,7 @@ class OnnxEmbeddings(Embeddings):
         query_prefix: str = "query: ",
         passage_prefix: str = "passage: ",
         output_name: str | None = None,
+        batch_size: int = 32,
     ):
         self.model_id = model_id
         self.model_path = model_path
@@ -328,6 +329,9 @@ class OnnxEmbeddings(Embeddings):
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         self.output_name = output_name
+        if batch_size < 1:
+            raise ValueError("ONNX embeddings batch_size must be >= 1")
+        self.batch_size = batch_size
         self._session = None
         self._tokenizer = None
         self._dimension: int | None = dimensions
@@ -386,7 +390,19 @@ class OnnxEmbeddings(Embeddings):
             self.normalize,
         )
         self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name_or_path)
-        self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        # ONNX Runtime's CPU arena grows to the largest allocation it has ever
+        # served and never returns that memory to the OS, so one oversized batch
+        # ratchets RSS up for the life of the process — on a memory-capped host
+        # that ends in an OOM kill while the worker sits idle. Same trade-off
+        # FlashRankCrossEncoder already makes (see cross_encoder.py): slightly
+        # slower per-call allocation in exchange for bounded RSS.
+        session_options = ort.SessionOptions()
+        session_options.enable_cpu_mem_arena = False
+        self._session = ort.InferenceSession(
+            model_path,
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
 
         detected = len(self.encode(["test"])[0])
         if self.configured_dimensions is not None and detected != self.configured_dimensions:
@@ -413,21 +429,38 @@ class OnnxEmbeddings(Embeddings):
         if not texts:
             return []
 
+        # One forward pass per batch, not one for the whole list: ``padding=True``
+        # pads every row to the longest sequence in the pass, so an unbatched call
+        # allocates ``len(texts) x max_tokens x hidden`` plus per-layer activations
+        # in a single tensor. Batching bounds that peak; results are unaffected
+        # because pooling masks the padding out either way.
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            embeddings.extend(self._encode_batch(texts[start : start + self.batch_size]))
+        return embeddings
+
+    def _encode_batch(self, texts: list[str]) -> list[list[float]]:
+        """Run one ONNX forward pass over at most ``batch_size`` texts."""
         import numpy as np
 
-        encoded = self._tokenizer(
+        session = self._session
+        tokenizer = self._tokenizer
+        if session is None or tokenizer is None:
+            raise RuntimeError("Embeddings not initialized. Call initialize() first.")
+
+        encoded = tokenizer(
             texts,
             padding=True,
             truncation=True,
             max_length=self.max_tokens,
             return_tensors="np",
         )
-        input_names = {inp.name for inp in self._session.get_inputs()}
+        input_names = {inp.name for inp in session.get_inputs()}
         ort_inputs = {name: value for name, value in encoded.items() if name in input_names}
         if "token_type_ids" in input_names and "token_type_ids" not in ort_inputs:
             ort_inputs["token_type_ids"] = np.zeros_like(encoded["input_ids"])
 
-        outputs = self._session.run([self.output_name] if self.output_name else None, ort_inputs)
+        outputs = session.run([self.output_name] if self.output_name else None, ort_inputs)
         token_embeddings = outputs[0]
 
         # Some exported models expose a pooled 2-D embedding as their first output.
