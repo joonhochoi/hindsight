@@ -49,8 +49,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Global semaphore to limit concurrent LLM requests across all instances.
 # Set HINDSIGHT_API_LLM_MAX_CONCURRENT=1 for local LLMs (LM Studio, Ollama).
-_llm_max_concurrent = int(os.getenv(ENV_LLM_MAX_CONCURRENT, str(DEFAULT_LLM_MAX_CONCURRENT)))
-_global_llm_semaphore = asyncio.Semaphore(_llm_max_concurrent)
+#
+# Resolved on FIRST USE, never at import. Hindsight's entry points call
+# load_dotenv_for_entrypoint() from inside main(), but main.py imports
+# MemoryEngine (and therefore this module) at module scope — dozens of lines
+# earlier. Reading the environment out here would run before .env is loaded, so
+# a cap set in .env was silently dropped and every deployment fell back to
+# DEFAULT_LLM_MAX_CONCURRENT. That is worse than an ignored setting: an operator
+# whose provider allows 2 connections sets 2, gets 32, and only finds out when
+# the provider starts rejecting calls.
+_global_llm_semaphore: asyncio.Semaphore | None = None
 
 
 def _build_per_op_semaphores() -> dict[str, asyncio.Semaphore]:
@@ -81,7 +89,31 @@ def _build_per_op_semaphores() -> dict[str, asyncio.Semaphore]:
     return semaphores
 
 
-_per_op_llm_semaphores: dict[str, asyncio.Semaphore] = _build_per_op_semaphores()
+_per_op_llm_semaphores: dict[str, asyncio.Semaphore] | None = None
+
+
+def _get_global_llm_semaphore() -> asyncio.Semaphore:
+    """The global cap, built from the environment the first time it is needed."""
+    global _global_llm_semaphore
+    if _global_llm_semaphore is None:
+        _global_llm_semaphore = asyncio.Semaphore(
+            int(os.getenv(ENV_LLM_MAX_CONCURRENT, str(DEFAULT_LLM_MAX_CONCURRENT)))
+        )
+    return _global_llm_semaphore
+
+
+def _get_per_op_llm_semaphores() -> dict[str, asyncio.Semaphore]:
+    """The per-operation registry, built from the environment on first use.
+
+    Tested against ``is None`` and not falsiness on purpose: an empty dict is the
+    valid "no per-op caps configured" state, and rebuilding it on every call
+    would both re-read the environment needlessly and defeat tests that patch the
+    registry to ``{}``.
+    """
+    global _per_op_llm_semaphores
+    if _per_op_llm_semaphores is None:
+        _per_op_llm_semaphores = _build_per_op_semaphores()
+    return _per_op_llm_semaphores
 
 
 def _scope_to_operation(scope: str) -> str | None:
@@ -107,12 +139,13 @@ def _semaphores_for_scope(scope: str) -> list[asyncio.Semaphore]:
     one is configured for the scope's operation bucket.
     """
     op = _scope_to_operation(scope)
-    per_op = _per_op_llm_semaphores.get(op) if op is not None else None
+    per_op = _get_per_op_llm_semaphores().get(op) if op is not None else None
+    global_semaphore = _get_global_llm_semaphore()
     if per_op is None:
-        return [_global_llm_semaphore]
+        return [global_semaphore]
     # Per-op acquired first so contention queues on the narrower cap before
     # holding a global slot.
-    return [per_op, _global_llm_semaphore]
+    return [per_op, global_semaphore]
 
 
 @asynccontextmanager

@@ -422,3 +422,68 @@ class TestSemaphoreEnforcement:
 
         assert retain_peak <= 2, f"retain cap exceeded: peak={retain_peak}"
         assert total_peak <= 3, f"global cap exceeded: peak={total_peak}"
+
+
+class TestCapsResolvedAfterImport:
+    """Concurrency caps must be read on first use, not at module import.
+
+    Hindsight's entry points load `.env` from inside `main()`, but `main.py`
+    imports `MemoryEngine` — and therefore `llm_wrapper` — at module scope, well
+    before that. Semaphores built at import time therefore never saw a cap set in
+    `.env`, and every deployment silently ran at `DEFAULT_LLM_MAX_CONCURRENT`.
+    """
+
+    def test_global_cap_honours_environment_set_after_import(self, monkeypatch):
+        monkeypatch.setattr(llm_wrapper, "_global_llm_semaphore", None)
+        monkeypatch.setenv("HINDSIGHT_API_LLM_MAX_CONCURRENT", "2")
+
+        assert llm_wrapper._get_global_llm_semaphore()._value == 2
+
+    def test_global_cap_falls_back_to_default_when_unset(self, monkeypatch):
+        monkeypatch.setattr(llm_wrapper, "_global_llm_semaphore", None)
+        monkeypatch.delenv("HINDSIGHT_API_LLM_MAX_CONCURRENT", raising=False)
+
+        assert llm_wrapper._get_global_llm_semaphore()._value == llm_wrapper.DEFAULT_LLM_MAX_CONCURRENT
+
+    def test_global_semaphore_is_built_once(self, monkeypatch):
+        """The cap is a process-wide gate; rebuilding it would hand out permits
+        that were never counted against the calls already in flight."""
+        monkeypatch.setattr(llm_wrapper, "_global_llm_semaphore", None)
+        monkeypatch.setenv("HINDSIGHT_API_LLM_MAX_CONCURRENT", "2")
+
+        assert llm_wrapper._get_global_llm_semaphore() is llm_wrapper._get_global_llm_semaphore()
+
+    def test_per_op_caps_honour_environment_set_after_import(self, monkeypatch):
+        monkeypatch.setattr(llm_wrapper, "_per_op_llm_semaphores", None)
+        monkeypatch.setenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", "1")
+        monkeypatch.delenv("HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT", raising=False)
+        monkeypatch.delenv("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT", raising=False)
+
+        assert llm_wrapper._get_per_op_llm_semaphores()["retain"]._value == 1
+
+    def test_empty_per_op_registry_is_not_rebuilt(self, monkeypatch):
+        """An empty registry means "no per-op caps configured", not "unset".
+
+        Guards the `is None` check: a falsiness check here would re-read the
+        environment on every call and override a test's patched registry.
+        """
+        monkeypatch.setattr(llm_wrapper, "_per_op_llm_semaphores", {})
+        monkeypatch.setenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", "1")
+
+        assert llm_wrapper._get_per_op_llm_semaphores() == {}
+
+    def test_semaphores_for_scope_resolves_both_caps_lazily(self, monkeypatch):
+        """The real dispatch path, not just the accessors: a cap that only
+        appears in the environment after import must reach the returned
+        semaphores."""
+        monkeypatch.setattr(llm_wrapper, "_global_llm_semaphore", None)
+        monkeypatch.setattr(llm_wrapper, "_per_op_llm_semaphores", None)
+        monkeypatch.setenv("HINDSIGHT_API_LLM_MAX_CONCURRENT", "2")
+        monkeypatch.setenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", "1")
+        monkeypatch.delenv("HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT", raising=False)
+        monkeypatch.delenv("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT", raising=False)
+
+        per_op, global_semaphore = _semaphores_for_scope("retain_extract_facts")
+
+        assert per_op._value == 1
+        assert global_semaphore._value == 2
