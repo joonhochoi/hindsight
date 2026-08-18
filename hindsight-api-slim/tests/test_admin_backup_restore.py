@@ -808,3 +808,53 @@ async def test_run_migration_threads_ensure_extensions_flag(monkeypatch, ensure_
     await admin_cli._run_migration("postgresql://test", schema="tenant_demo", ensure_extensions=ensure_extensions)
 
     assert captured["ensure_extensions"] is expected
+
+
+@pytest.mark.asyncio
+async def test_restore_advances_identity_sequences_past_restored_rows(backup_test_schema):
+    """An ordinary insert after a restore must not collide with restored ids.
+
+    Binary COPY carries explicit ids but leaves the IDENTITY sequence where it
+    started, so without a resync the next insert draws an id the restored rows
+    already occupy and dies on the primary key. Seen in production as::
+
+        duplicate key value violates unique constraint "observation_history_pkey"
+        DETAIL:  Key (id)=(6) already exists.
+    """
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    bank_id = f"seq-test-{uuid.uuid4().hex[:8]}"
+    conn = await asyncpg.connect(db_url)
+
+    try:
+        await conn.execute(f"INSERT INTO {_fq('banks')} (bank_id) VALUES ($1)", bank_id)
+        # Explicit ids, exactly what a restored archive carries.
+        for explicit_id in (1, 2, 3):
+            await conn.execute(
+                f"""INSERT INTO {_fq("observation_history")}
+                    (id, observation_id, bank_id, content)
+                    VALUES ($1, $2, $3, '{{}}'::jsonb)""",
+                explicit_id,
+                uuid.uuid4(),
+                bank_id,
+            )
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            backup_path = Path(f.name)
+        try:
+            await _backup(db_url, backup_path, schema=schema_name)
+            await _restore(db_url, backup_path, schema=schema_name)
+        finally:
+            backup_path.unlink(missing_ok=True)
+
+        # The insert that used to fail: no explicit id, so it draws from the sequence.
+        new_id = await conn.fetchval(
+            f"""INSERT INTO {_fq("observation_history")}
+                (observation_id, bank_id, content)
+                VALUES ($1, $2, '{{}}'::jsonb) RETURNING id""",
+            uuid.uuid4(),
+            bank_id,
+        )
+
+        assert new_id == 4, f"sequence must continue past the restored rows, got id={new_id}"
+    finally:
+        await conn.close()

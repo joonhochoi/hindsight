@@ -325,6 +325,56 @@ async def _backup(
         await conn.close()
 
 
+async def _resync_identity_sequences(conn: asyncpg.Connection, tables: list[str], schema: str) -> int:
+    """Advance each restored table's identity sequence past the rows just copied.
+
+    Binary COPY carries explicit id values but never advances the sequence behind
+    an IDENTITY/SERIAL column, so after a restore the sequence still sits where it
+    started. The first ordinary insert then hands out an id the restored rows
+    already occupy and dies on the primary key::
+
+        duplicate key value violates unique constraint "observation_history_pkey"
+        DETAIL:  Key (id)=(6) already exists.
+
+    The failure surfaces later, under normal writes, which reads as a runtime bug
+    rather than a restore that never finished — and it keeps recurring until the
+    sequence climbs past the highest restored id.
+
+    The bank-scoped export path sidesteps this by dropping the surrogate id and
+    letting the target reassign it (see ``engine/transfer/export.py``). A
+    whole-schema restore cannot: it has to carry ids so foreign keys keep pointing
+    at the right rows. So it fixes the sequences afterwards instead — the same
+    thing ``pg_dump`` emits ``setval()`` calls for.
+
+    Returns the number of sequences advanced.
+    """
+    resynced = 0
+    for table in tables:
+        # quote_ident comes from the server so an unusual column name is escaped
+        # correctly; the sequence name is passed as a bind parameter.
+        columns = await conn.fetch(
+            """
+            SELECT quote_ident(column_name) AS quoted_column,
+                   pg_get_serial_sequence(format('%I.%I', $1::text, $2::text), column_name) AS sequence_name
+            FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+              AND pg_get_serial_sequence(format('%I.%I', $1::text, $2::text), column_name) IS NOT NULL
+            """,
+            schema,
+            table,
+        )
+        for column in columns:
+            # is_called=false so the next nextval() returns MAX+1 itself rather
+            # than skipping it; COALESCE covers a table that restored empty.
+            await conn.execute(
+                f"SELECT setval($1, COALESCE((SELECT MAX({column['quoted_column']}) "
+                f"FROM {_fq_table(table, schema)}), 0) + 1, false)",
+                column["sequence_name"],
+            )
+            resynced += 1
+    return resynced
+
+
 async def _restore(
     database_url: str,
     input_path: Path,
@@ -383,6 +433,12 @@ async def _restore(
                         source=buffer,
                         format="binary",
                     )
+
+                # Must happen before anything writes to the restored tables:
+                # COPY carried the ids but left every identity sequence behind.
+                typer.echo("  Resyncing identity sequences...")
+                resynced = await _resync_identity_sequences(conn, backup_tables, schema)
+                typer.echo(f"  Resynced {resynced} sequences")
 
                 # Refresh materialized view
                 typer.echo("  Refreshing materialized views...")
