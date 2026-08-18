@@ -20,6 +20,11 @@ export default defineConfig({
     // Cline CLI loads this module through `cline plugin install`; file hooks cannot mutate
     // model requests, so the native beforeModel hook is the reliable injection path.
     cline: "src/cline.ts",
+    // DeepSeek Harness loads this as a native Cordis plugin — see src/dsh.ts.
+    dsh: "src/dsh.ts",
+    // Prime Agent loads this module as an extension (default export) by absolute path from its
+    // settings.json `extensions` array, so it must be self-contained like the hook bins.
+    "prime-agent": "src/prime-agent.ts",
     "grok-hook": "src/grok-hook.ts",
     "grok-sessionstart-hook": "src/grok-sessionstart-hook.ts",
     "grok-stop-hook": "src/grok-stop-hook.ts",

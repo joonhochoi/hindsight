@@ -330,7 +330,7 @@ def create_llm_provider(
     api_key: str,
     base_url: str,
     model: str,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     groq_service_tier: str | None = None,
     openai_service_tier: str | None = None,
     bedrock_service_tier: str | None = None,
@@ -346,6 +346,7 @@ def create_llm_provider(
     timeout: float | None = None,
     ollama_num_ctx: int | None = None,
     cache_affinity: str | None = None,
+    structured_output_forced_tool: bool = False,
 ) -> Any:  # Returns LLMInterface
     """
     Factory function to create the appropriate LLM provider implementation.
@@ -355,7 +356,9 @@ def create_llm_provider(
         api_key: API key (may be None for local providers or OAuth providers).
         base_url: Base URL for the API.
         model: Model name.
-        reasoning_effort: Reasoning effort level for supported providers.
+        reasoning_effort: Reasoning effort level for supported providers, or None when
+            the operator configured none (providers then fall back to the default level
+            and may skip the parameter entirely).
         groq_service_tier: Groq service tier (for Groq provider) - "on_demand", "flex", or "auto".
         openai_service_tier: OpenAI service tier (for OpenAI provider) - None (default) or "flex" (50% cheaper).
         bedrock_service_tier: Bedrock service tier (for Bedrock provider) - None (default), "flex", "priority", or "reserved".
@@ -378,6 +381,11 @@ def create_llm_provider(
             OpenAI-compatible wire format): "none" (default), "xai_conv_id",
             "openai_prompt_cache_key", or "auto". Providers on other branches do their own
             cache work or none at all. See ``engine/cache_affinity.py``.
+        structured_output_forced_tool: Ask the LiteLLM-backed providers (``litellm``,
+            ``litellmrouter``, ``bedrock``) for structured output via a forced tool call
+            instead of ``response_format``. For backends that reject the response_format
+            route — see ``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``. Other
+            providers ignore it.
         vertexai_project_id: Vertex AI project ID (for VertexAI provider).
         vertexai_region: Vertex AI region (for VertexAI provider).
         vertexai_credentials: Vertex AI credentials object (for VertexAI provider).
@@ -490,6 +498,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             timeout=timeout,
+            structured_output_forced_tool=structured_output_forced_tool,
         )
 
     elif provider_lower == "litellmrouter":
@@ -510,6 +519,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             timeout=timeout,
+            structured_output_forced_tool=structured_output_forced_tool,
         )
 
     elif provider_lower == "bedrock":
@@ -525,6 +535,7 @@ def create_llm_provider(
             default_headers=default_headers,
             bedrock_service_tier=bedrock_service_tier,
             timeout=timeout,
+            structured_output_forced_tool=structured_output_forced_tool,
         )
 
     elif provider_lower == "llamacpp":
@@ -537,6 +548,7 @@ def create_llm_provider(
             base_url=base_url,
             model=model,
             reasoning_effort=reasoning_effort,
+            extra_body=extra_body,
             model_path=config.llamacpp_model_path,
             gpu_layers=config.llamacpp_gpu_layers,
             context_size=config.llamacpp_context_size,
@@ -660,7 +672,7 @@ class LLMProvider:
         api_key: str,
         base_url: str,
         model: str,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
         groq_service_tier: str | None = None,
         openai_service_tier: str | None = None,
         bedrock_service_tier: str | None = None,
@@ -679,6 +691,7 @@ class LLMProvider:
         max_backoff: float | None = None,
         ollama_num_ctx: int | None = None,
         cache_affinity: str | None = None,
+        structured_output_forced_tool: bool = False,
     ):
         """
         Initialize LLM provider.
@@ -688,7 +701,8 @@ class LLMProvider:
             api_key: API key.
             base_url: Base URL for the API.
             model: Model name.
-            reasoning_effort: Reasoning effort level for supported providers.
+            reasoning_effort: Reasoning effort level for supported providers, or None
+                when the operator configured none.
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto") - from config.
             openai_service_tier: OpenAI service tier (None or "flex") - from config.
             bedrock_service_tier: Bedrock service tier (None, "flex", "priority", "reserved") - from config.
@@ -725,6 +739,9 @@ class LLMProvider:
                 ``max_retries``. ``None`` keeps each method's own fallback.
             max_backoff: Default maximum retry backoff (seconds), same resolution as
                 ``max_retries``. ``None`` keeps each method's own fallback.
+            structured_output_forced_tool: Structured output via a forced tool call
+                instead of ``response_format``, for the LiteLLM-backed providers - from
+                config (``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``).
 
         This constructor uses every argument as passed and does not read global
         ``HindsightConfig``: resolving the server-level default for a ``None`` argument is the
@@ -753,6 +770,9 @@ class LLMProvider:
         self.openai_service_tier = openai_service_tier
         self.bedrock_service_tier = bedrock_service_tier
         self.gemini_service_tier = gemini_service_tier
+        # Structured-output transport for the LiteLLM-backed providers. Used verbatim —
+        # the caller resolves the server-level default, like the fields above.
+        self.structured_output_forced_tool = structured_output_forced_tool
         self.ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
         # Gemini safety settings (instance default; can be overridden per-request via context var)
         self.gemini_safety_settings = gemini_safety_settings
@@ -908,6 +928,7 @@ class LLMProvider:
             ollama_num_ctx=self.ollama_num_ctx,
             timeout=self.timeout,
             cache_affinity=self.cache_affinity,
+            structured_output_forced_tool=self.structured_output_forced_tool,
         )
 
         # Backward compatibility: Keep mock provider properties
@@ -1452,7 +1473,7 @@ class LLMProvider:
             DEFAULT_LLM_OPENAI_SERVICE_TIER,
             DEFAULT_LLM_PROMPT_CACHE_ENABLED,
             DEFAULT_LLM_PROVIDER,
-            DEFAULT_LLM_REASONING_EFFORT,
+            DEFAULT_LLM_STRUCTURED_OUTPUT_FORCED_TOOL,
             DEFAULT_LLM_TIMEOUT,
             ENV_LLM_API_KEY,
             ENV_LLM_BASE_URL,
@@ -1470,11 +1491,13 @@ class LLMProvider:
             ENV_LLM_PROMPT_CACHE_ENABLED,
             ENV_LLM_PROVIDER,
             ENV_LLM_REASONING_EFFORT,
+            ENV_LLM_STRUCTURED_OUTPUT_FORCED_TOOL,
             ENV_LLM_TIMEOUT,
             ENV_LLM_VERTEXAI_PROJECT_ID,
             ENV_LLM_VERTEXAI_REGION,
             ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY,
             _get_default_model_for_provider,
+            _parse_boolean_env,
             _parse_llm_router_config,
             _parse_optional_positive_int,
             parse_gemini_service_tier,
@@ -1511,7 +1534,7 @@ class LLMProvider:
             api_key=api_key,
             base_url=base_url,
             model=model,
-            reasoning_effort=os.getenv(ENV_LLM_REASONING_EFFORT, DEFAULT_LLM_REASONING_EFFORT),
+            reasoning_effort=os.getenv(ENV_LLM_REASONING_EFFORT) or None,
             extra_body=extra_body,
             default_headers=default_headers,
             cache_affinity=cache_affinity,
@@ -1531,6 +1554,10 @@ class LLMProvider:
             vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION) or None,
             vertexai_service_account_key=os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY) or None,
             timeout=float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT))),
+            structured_output_forced_tool=_parse_boolean_env(
+                ENV_LLM_STRUCTURED_OUTPUT_FORCED_TOOL,
+                DEFAULT_LLM_STRUCTURED_OUTPUT_FORCED_TOOL,
+            ),
         )
 
 

@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from hindsight_api.api import page_markdown
 from hindsight_api.api.disconnect import ClientDisconnectCancellationMiddleware, get_scope_cancellation_token
+from hindsight_api.api.passthrough_headers import collect_passthrough_headers
 from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.audit import (
     AuditEntry,
@@ -598,6 +599,14 @@ class RecallResponse(BaseModel):
     source_facts: dict[str, RecallResult] | None = Field(
         default=None, description="Source facts for observation-type results, keyed by fact ID"
     )
+    source_facts_truncated: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the source_facts map was cut short by the token budget. When true, some IDs in "
+            "results[].source_fact_ids have no entry in source_facts — the budget ran out, the "
+            "references are not dangling. Only set when source facts were requested."
+        ),
+    )
 
 
 class EntityInput(BaseModel):
@@ -967,17 +976,21 @@ class ReflectRequest(BaseModel):
     )
     tags: list[str] | None = Field(
         default=None,
-        description="Filter memories by tags during reflection. If not specified, all memories are considered.",
+        description="Scope raw facts, observations, mental models, and tagged directives during reflection. "
+        "With no tags, memory retrieval is unfiltered while only untagged/global directives are loaded. "
+        "Use tags=[] with tags_match='exact' to select the untagged/global scope.",
     )
     tags_match: TagsMatch = Field(
         default="any",
         description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
-        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), or "
+        "'exact' (set equality). Untagged directives remain global in every mode.",
     )
     tag_groups: list[TagGroup] | None = Field(
         default=None,
         description="Compound tag filter using boolean groups. Groups in the list are AND-ed. "
-        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.",
+        "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. "
+        "Mutually exclusive with tags.",
     )
     apply_all_directives: bool = Field(
         default=False,
@@ -1438,8 +1451,7 @@ class BankConfigUpdate(BaseModel):
         json_schema_extra={
             "example": {
                 "updates": {
-                    "llm_model": "claude-sonnet-4-5",
-                    "retain_extraction_mode": "verbose",
+                    "retain_extraction_mode": "custom",
                     "retain_custom_instructions": "Extract technical details carefully",
                 }
             }
@@ -1447,8 +1459,8 @@ class BankConfigUpdate(BaseModel):
     )
 
     updates: dict[str, Any] = Field(
-        description="Configuration overrides. Keys can be in Python field format (llm_provider) "
-        "or environment variable format (HINDSIGHT_API_LLM_PROVIDER). "
+        description="Configuration overrides. Keys can be in Python field format (retain_extraction_mode) "
+        "or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE). "
         "Only hierarchical fields can be overridden per-bank."
     )
 
@@ -1461,12 +1473,10 @@ class BankConfigResponse(BaseModel):
             "example": {
                 "bank_id": "my-bank",
                 "config": {
-                    "llm_provider": "openai",
-                    "llm_model": "gpt-4",
                     "retain_extraction_mode": "verbose",
+                    "retain_chunk_size": 3000,
                 },
                 "overrides": {
-                    "llm_model": "gpt-4",
                     "retain_extraction_mode": "verbose",
                 },
             }
@@ -1980,12 +1990,19 @@ class BankStatsResponse(BaseModel):
         default=None,
         description=(
             "When a memory was last written in this bank — stored, edited, or consolidated (ISO format). "
-            "Null if the bank has no memories. A mental model whose `last_refreshed_at` is at or after this "
-            "is up to date whatever its tags; an older one may need a refresh, which only the single "
+            "Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after "
+            "this is up to date whatever its tags; an older one may need a refresh, which only the single "
             "mental-model read can confirm."
         ),
     )
-    pending_consolidation: int = Field(default=0, description="Number of memories not yet processed into observations")
+    pending_consolidation: int = Field(
+        default=0,
+        description=(
+            "Number of source memories (world/experience) still queued for consolidation into "
+            "observations. Excludes memories whose consolidation permanently failed — those are "
+            "counted only in failed_consolidation — so this drains to 0 when the consolidator catches up."
+        ),
+    )
     failed_consolidation: int = Field(
         default=0,
         description="Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
@@ -2093,6 +2110,9 @@ class DirectiveListResponse(BaseModel):
     """Response model for listing directives."""
 
     items: list[DirectiveResponse]
+    total: int = Field(description="Total number of directives matching the filter (not just this page)")
+    limit: int = Field(description="Page size that was applied")
+    offset: int = Field(description="Offset that was applied")
 
 
 class CreateDirectiveRequest(BaseModel):
@@ -2102,7 +2122,10 @@ class CreateDirectiveRequest(BaseModel):
     content: str = Field(description="The directive text to inject into prompts")
     priority: int = Field(default=0, description="Higher priority directives are injected first")
     is_active: bool = Field(default=True, description="Whether this directive is active")
-    tags: list[str] = FieldWithDefault(list, description="Tags for filtering")
+    tags: list[str] = FieldWithDefault(
+        list,
+        description="Directive execution scope. Empty means global; non-empty requires a matching reflect scope.",
+    )
 
 
 class UpdateDirectiveRequest(BaseModel):
@@ -2273,7 +2296,26 @@ class MentalModelResponse(BaseModel):
     tags: list[str] = FieldWithDefault(list)
     max_tokens: int | None = Field(default=None)
     trigger: MentalModelTrigger | None = Field(default=None)
-    last_refreshed_at: str | None = None
+    last_refreshed_at: str | None = Field(
+        default=None,
+        description=(
+            "When a refresh last finished for this model — wall-clock, in ISO format. Advances on "
+            "every refresh that completes, including one that found nothing new and preserved the "
+            "content, and on a direct edit of `content`. A refresh that failed leaves it alone. "
+            "This is the field to answer 'have I already refreshed this?'; it says nothing about "
+            "whether the model is behind the data, which is `last_memory_seen_at` / `is_stale`."
+        ),
+    )
+    last_memory_seen_at: str | None = Field(
+        default=None,
+        description=(
+            "How far through the bank's memories this model is written — the newest in-scope memory "
+            "the last refresh saw, in ISO format. Stands still when nothing in the model's scope has "
+            "been written, however often it is refreshed. Compare against `last_memory_write_at` "
+            "from GET /stats to flag a whole list cheaply: at or after it means up to date, older "
+            "means it may need a refresh. Null for a model no refresh has stamped yet."
+        ),
+    )
     created_at: str | None = None
     reflect_response: dict | None = Field(
         default=None,
@@ -2283,9 +2325,9 @@ class MentalModelResponse(BaseModel):
         default=None,
         description=(
             "True when memories matching this mental model's tag/fact_type scope have been written "
-            "since last_refreshed_at. Exact, and costly to compute, so it is populated only by the "
+            "since last_memory_seen_at. Exact, and costly to compute, so it is populated only by the "
             "single mental-model read at detail=full — never when listing. For a whole list, compare "
-            "each `last_refreshed_at` against the bank's `last_memory_write_at` from GET /stats: "
+            "each `last_memory_seen_at` against the bank's `last_memory_write_at` from GET /stats: "
             "at or after it means up to date, older means it may need a refresh."
         ),
     )
@@ -2295,6 +2337,9 @@ class MentalModelListResponse(BaseModel):
     """Response model for listing mental models."""
 
     items: list[MentalModelResponse]
+    total: int = Field(description="Total number of mental models matching the filter (not just this page)")
+    limit: int = Field(description="Page size that was applied")
+    offset: int = Field(description="Offset that was applied")
 
 
 # =========================================================================
@@ -2364,6 +2409,16 @@ class UpdateNodeRequest(BaseModel):
     source_query: str | None = None
     tags: list[str] | None = None
     max_tokens: int | None = None
+    trigger: MentalModelTrigger | None = Field(
+        default=None,
+        description=(
+            "Refresh settings to change. Applied as a patch: only the fields present in this "
+            "object are updated, and the rest keep the page's current values — so moving a page "
+            "onto a schedule does not reset how it refreshes. Setting refresh_cron clears "
+            "refresh_after_consolidation and vice versa, since a page refreshes on one or the "
+            "other, never both."
+        ),
+    )
 
 
 class CreateKnowledgePageResponse(BaseModel):
@@ -2901,17 +2956,21 @@ async def apply_bank_template_manifest(
     projected_mental_model_ids = {item.id for item in default_mental_models} & imported_mental_model_ids
     projected_directive_names = {item.name for item in default_directives} & imported_directive_names
 
+    # limit=None throughout the import path: a create/update decision per imported
+    # resource is only correct against the bank's *whole* set. Under the default
+    # page size a bank with more than 100 models would look like it lacked the
+    # ones past the first page, and the import would create duplicates.
     existing_by_id: dict[str, dict[str, Any]] = {}
     if bank_exists and manifest.mental_models:
-        existing = await memory.list_mental_models(bank_id=bank_id, request_context=request_context)
-        existing_by_id = {m["id"]: m for m in existing}
+        existing = await memory.list_mental_models(bank_id=bank_id, limit=None, request_context=request_context)
+        existing_by_id = {m["id"]: m for m in existing.items}
 
     existing_by_name: dict[str, dict[str, Any]] = {}
     if bank_exists and manifest.directives:
         existing_directives = await memory.list_directives(
-            bank_id=bank_id, active_only=False, request_context=request_context
+            bank_id=bank_id, active_only=False, limit=None, request_context=request_context
         )
-        existing_by_name = {d["name"]: d for d in existing_directives}
+        existing_by_name = {d["name"]: d for d in existing_directives.items}
 
     bank_writes: list[BankTemplateImportWrite] = []
     if config_updates:
@@ -2955,9 +3014,10 @@ async def apply_bank_template_manifest(
         if projected_mental_model_ids:
             provisioned = await memory.list_mental_models(
                 bank_id=bank_id,
+                limit=None,
                 request_context=request_context,
             )
-            provisioned_by_id = {item["id"]: item for item in provisioned}
+            provisioned_by_id = {item["id"]: item for item in provisioned.items}
             existing_by_id.update(
                 {
                     item_id: provisioned_by_id[item_id]
@@ -2969,9 +3029,10 @@ async def apply_bank_template_manifest(
             provisioned = await memory.list_directives(
                 bank_id=bank_id,
                 active_only=False,
+                limit=None,
                 request_context=request_context,
             )
-            provisioned_by_name = {item["name"]: item for item in provisioned}
+            provisioned_by_name = {item["name"]: item for item in provisioned.items}
             existing_by_name.update(
                 {name: provisioned_by_name[name] for name in projected_directive_names & provisioned_by_name.keys()}
             )
@@ -2999,17 +3060,18 @@ async def apply_default_bank_template_resources(
     """Apply only the resources from a server-owned default template."""
     existing_by_id: dict[str, dict[str, Any]] = {}
     if manifest.mental_models:
-        existing = await memory.list_mental_models(bank_id=bank_id, request_context=request_context)
-        existing_by_id = {model["id"]: model for model in existing}
+        existing = await memory.list_mental_models(bank_id=bank_id, limit=None, request_context=request_context)
+        existing_by_id = {model["id"]: model for model in existing.items}
 
     existing_by_name: dict[str, dict[str, Any]] = {}
     if manifest.directives:
         existing_directives = await memory.list_directives(
             bank_id=bank_id,
             active_only=False,
+            limit=None,
             request_context=request_context,
         )
-        existing_by_name = {directive["name"]: directive for directive in existing_directives}
+        existing_by_name = {directive["name"]: directive for directive in existing_directives.items}
 
     await _apply_bank_template_resources(
         memory,
@@ -3167,6 +3229,15 @@ class OperationResponse(BaseModel):
         default=None,
         description="Original filename for file-conversion operations (file_convert_retain); null for other task types.",
     )
+    mental_model_id: str | None = Field(
+        default=None,
+        description=(
+            "Mental model this operation acted on (refresh_mental_model); null for other task types. "
+            "Without it the list cannot say which model an operation refreshed — `document_id` is null "
+            "for these, and the list carries no result_metadata. The single-operation read exposes the "
+            "same value under `result_metadata`."
+        ),
+    )
     created_at: str
     updated_at: str | None = Field(
         default=None,
@@ -3228,6 +3299,7 @@ class OperationsListResponse(BaseModel):
                     {
                         "id": "550e8400-e29b-41d4-a716-446655440000",
                         "task_type": "retain",
+                        "items_count": 5,
                         "created_at": "2024-01-15T10:30:00Z",
                         "status": "pending",
                         "error_message": None,
@@ -3316,7 +3388,7 @@ class OperationStatusResponse(BaseModel):
             "example": {
                 "operation_id": "550e8400-e29b-41d4-a716-446655440000",
                 "status": "completed",
-                "operation_type": "refresh_mental_models",
+                "operation_type": "refresh_mental_model",
                 "created_at": "2024-01-15T10:30:00Z",
                 "updated_at": "2024-01-15T10:31:30Z",
                 "completed_at": "2024-01-15T10:31:30Z",
@@ -3402,15 +3474,19 @@ class VersionResponse(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "api_version": "0.4.0",
+                "api_version": "0.9.0",
                 "features": {
                     "observations": False,
                     "mcp": True,
                     "worker": True,
                     "bank_config_api": False,
+                    "bank_llm_health": True,
                     "file_upload_api": True,
                     "document_export_api": True,
                     "document_import_api": True,
+                    "audit_log": False,
+                    "llm_trace": False,
+                    "store_document_text": True,
                 },
             }
         }
@@ -3954,15 +4030,20 @@ def _register_routes(app: FastAPI):
     # Create audit decorator bound to this app's audit logger
     audited = _make_audited_http(lambda: getattr(app.state, "audit_logger", None))
 
-    def get_request_context(authorization: str | None = Header(default=None)) -> RequestContext:
+    def get_request_context(request: Request, authorization: str | None = Header(default=None)) -> RequestContext:
         """
-        Extract request context from Authorization header.
+        Extract request context from the Authorization header.
 
         Supports:
         - Bearer token: "Bearer <api_key>"
         - Direct API key: "<api_key>"
 
         Returns RequestContext with extracted API key (may be None if no auth header).
+
+        Any header named in HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS is also
+        copied into ``extra_headers`` for extensions to read. That allowlist is
+        empty by default, so no other header reaches extension code unless an
+        operator opts in.
         """
         api_key = None
         if authorization:
@@ -3970,7 +4051,8 @@ def _register_routes(app: FastAPI):
                 api_key = authorization[7:].strip()
             else:
                 api_key = authorization.strip()
-        return RequestContext(api_key=api_key)
+        extra_headers = collect_passthrough_headers(request.headers.raw, get_config().extension_passthrough_headers)
+        return RequestContext(api_key=api_key, extra_headers=extra_headers)
 
     def precheck_for(operation: PrecheckOperation):
         """
@@ -4040,6 +4122,19 @@ def _register_routes(app: FastAPI):
         return JSONResponse(
             status_code=401,
             content={"detail": str(exc)},
+        )
+
+    # A bank briefly closed to writes — a store migrating it between backends holds it for a few
+    # seconds. 503 + Retry-After rather than a 500: nothing is broken, and the difference decides
+    # whether a client retries or reports a failure to the user.
+    from ..engine.memories.base import StoreWriteUnavailable
+
+    @app.exception_handler(StoreWriteUnavailable)
+    async def store_write_unavailable_handler(request, exc: StoreWriteUnavailable):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc)},
+            headers={"Retry-After": str(getattr(exc, "retry_after", 30))},
         )
 
     async def _readiness_response() -> JSONResponse:
@@ -4637,6 +4732,7 @@ def _register_routes(app: FastAPI):
                 entities=entities_response,
                 chunks=chunks_response,
                 source_facts=source_facts_response,
+                source_facts_truncated=core_result.source_facts_truncated,
             )
 
             handler_duration = time.time() - handler_start
@@ -5144,7 +5240,7 @@ def _register_routes(app: FastAPI):
     ):
         """List mental models for a bank."""
         try:
-            mental_models = await app.state.memory.list_mental_models(
+            page = await app.state.memory.list_mental_models(
                 bank_id=bank_id,
                 tags=tags_filter,
                 tags_match=tags_match,
@@ -5153,7 +5249,12 @@ def _register_routes(app: FastAPI):
                 offset=offset,
                 request_context=request_context,
             )
-            return MentalModelListResponse(items=[MentalModelResponse(**m) for m in mental_models])
+            return MentalModelListResponse(
+                items=[MentalModelResponse(**m) for m in page.items],
+                total=page.total,
+                limit=limit,
+                offset=offset,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
@@ -5607,7 +5708,11 @@ def _register_routes(app: FastAPI):
                 parent_id=body.parent_id,
                 tags=body.tags if body.tags else None,
                 max_tokens=body.max_tokens,
-                trigger=body.trigger.model_dump() if body.trigger else None,
+                # Only what the client actually set: the engine merges these over the
+                # knowledge-page defaults, and a full dump would drown them in this model's
+                # own field defaults (mode="full", exclude_mental_models=False) — which is
+                # how every page created with a trigger lost its delta refresh (#3506).
+                trigger=body.trigger.model_dump(exclude_unset=True) if body.trigger else None,
                 request_context=request_context,
             )
             if node is None:
@@ -5755,8 +5860,10 @@ def _register_routes(app: FastAPI):
         response_model=KnowledgeNode,
         summary="Rename/move a knowledge-base node or update a page's options",
         description="Rename a node (set `name`), move it under another folder (set `parent_id`, null "
-        "for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`). "
-        "Changing `source_query` schedules an async refresh so the page rebuilds against the new question.",
+        "for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`, `trigger`). "
+        "Changing `source_query` schedules an async refresh so the page rebuilds against the new question. "
+        "`trigger` is applied as a patch: the fields you send are updated and the rest keep the page's "
+        "current values.",
         operation_id="update_knowledge_node",
         tags=["Knowledge Base"],
     )
@@ -5784,7 +5891,7 @@ def _register_routes(app: FastAPI):
                 )
             # Page options live on the backing mental model; each applies only when
             # present in the body (so tags=[] clears, distinct from "not provided").
-            page_fields = {"source_query", "tags", "max_tokens"} & body.model_fields_set
+            page_fields = {"source_query", "tags", "max_tokens", "trigger"} & body.model_fields_set
             if page_fields:
                 did_change = True
                 updated = await app.state.memory.update_knowledge_page(
@@ -5793,6 +5900,10 @@ def _register_routes(app: FastAPI):
                     source_query=body.source_query if "source_query" in page_fields else None,
                     tags=body.tags if "tags" in page_fields else None,
                     max_tokens=body.max_tokens if "max_tokens" in page_fields else None,
+                    # Only the trigger fields the client stated: the engine patches them over
+                    # the page's current trigger, and a full dump would carry this model's own
+                    # defaults (mode="full", exclude_mental_models=False) into every update.
+                    trigger=(body.trigger.model_dump(exclude_unset=True) if body.trigger else None),
                     request_context=request_context,
                 )
                 # A new source query means the content is stale — rebuild it.
@@ -5804,7 +5915,8 @@ def _register_routes(app: FastAPI):
                     )
             if not did_change:
                 raise HTTPException(
-                    status_code=400, detail="Provide name, parent_id, source_query, tags, and/or max_tokens to update"
+                    status_code=400,
+                    detail="Provide name, parent_id, source_query, tags, max_tokens, and/or trigger to update",
                 )
             if updated is None:
                 raise HTTPException(status_code=404, detail=f"Knowledge node '{node_id}' not found")
@@ -5861,14 +5973,21 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/directives",
         response_model=DirectiveListResponse,
         summary="List directives",
-        description="List hard rules that are injected into prompts.",
+        description="List directive definitions. Unlike reflect, an omitted tag filter returns all directives.",
         operation_id="list_directives",
         tags=["Directives"],
     )
     async def api_list_directives(
         bank_id: str,
-        tags_filter: list[str] | None = Query(None, alias="tags", description="Filter by tags"),
-        tags_match: Literal["any", "all", "exact"] = Query("any", description="How to match tags"),
+        tags_filter: list[str] | None = Query(
+            None,
+            alias="tags",
+            description="Filter directives by execution scope. Omit or pass [] to list all directives.",
+        ),
+        tags_match: Literal["any", "all", "exact"] = Query(
+            "any",
+            description="How tagged directives match the requested scope. Untagged/global directives are included.",
+        ),
         active_only: bool = Query(True, description="Only return active directives"),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
@@ -5876,7 +5995,7 @@ def _register_routes(app: FastAPI):
     ):
         """List directives for a bank."""
         try:
-            directives = await app.state.memory.list_directives(
+            page = await app.state.memory.list_directives(
                 bank_id=bank_id,
                 tags=tags_filter,
                 tags_match=tags_match,
@@ -5885,7 +6004,12 @@ def _register_routes(app: FastAPI):
                 offset=offset,
                 request_context=request_context,
             )
-            return DirectiveListResponse(items=[DirectiveResponse(**d) for d in directives])
+            return DirectiveListResponse(
+                items=[DirectiveResponse(**d) for d in page.items],
+                total=page.total,
+                limit=limit,
+                offset=offset,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
@@ -5935,7 +6059,7 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/directives",
         response_model=DirectiveResponse,
         summary="Create directive",
-        description="Create a hard rule that will be injected into prompts.",
+        description="Create a global or tag-scoped hard rule for reflect prompts.",
         operation_id="create_directive",
         tags=["Directives"],
     )
@@ -6984,12 +7108,13 @@ def _register_routes(app: FastAPI):
             filtered_overrides = {k: v for k, v in bank_overrides.items() if k in template_config_fields}
             bank_config = BankTemplateConfig(**filtered_overrides) if filtered_overrides else None
 
-            # Get mental models
+            # Get mental models (limit=None — an export that stopped at the
+            # default page size would silently drop the rest of the bank)
             mental_models_raw = await app.state.memory.list_mental_models(
-                bank_id=bank_id, request_context=request_context
+                bank_id=bank_id, limit=None, request_context=request_context
             )
             template_mental_models: list[BankTemplateMentalModel] = []
-            for mm in mental_models_raw:
+            for mm in mental_models_raw.items:
                 trigger_data = mm.get("trigger", {})
                 trigger = MentalModelTrigger(**trigger_data) if trigger_data else MentalModelTrigger()
                 template_mental_models.append(
@@ -7003,12 +7128,12 @@ def _register_routes(app: FastAPI):
                     )
                 )
 
-            # Get directives
+            # Get directives (limit=None for the same reason as the models above)
             directives_raw = await app.state.memory.list_directives(
-                bank_id=bank_id, active_only=False, request_context=request_context
+                bank_id=bank_id, active_only=False, limit=None, request_context=request_context
             )
             template_directives: list[BankTemplateDirective] = []
-            for d in directives_raw:
+            for d in directives_raw.items:
                 template_directives.append(
                     BankTemplateDirective(
                         name=d["name"],
@@ -7406,8 +7531,9 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/config",
         response_model=BankConfigResponse,
         summary="Update bank configuration",
-        description="Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). "
-        "Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).",
+        description="Update configuration overrides for a bank. Only hierarchical behavioral settings can be "
+        "overridden (retention parameters, recall settings, etc.). Keys can be provided in Python field format "
+        "(retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE).",
         operation_id="update_bank_config",
         tags=["Banks"],
     )

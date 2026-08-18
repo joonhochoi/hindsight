@@ -678,6 +678,54 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
 
 
 @pytest.mark.asyncio
+async def test_bank_import_into_new_id_on_same_instance(memory, request_context):
+    """Export a bank and import it RIGHT BACK into a new id on the same instance
+    (source bank left in place). The banks row carries a globally-unique
+    ``internal_id``; if that were kept, the copy's banks INSERT would collide with
+    the still-present source and ``ON CONFLICT DO NOTHING`` would skip the parent
+    row, so the mental_models insert would trip fk_mental_models_bank_id. Import
+    must mint a fresh internal_id so the copy lands cleanly. Regression for #3270."""
+    source = _unique_bank("bank_src")
+    target = _unique_bank("bank_copy")
+    try:
+        await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
+        await memory.create_mental_model(
+            source,
+            name="Work model",
+            source_query="where do people work",
+            content="User tracks where people work.",
+            mental_model_id="mm-1",
+            request_context=request_context,
+        )
+
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            source_internal_id = await conn.fetchval(
+                f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", source
+            )
+
+        from hindsight_api.engine.transfer import export_bank
+
+        async with acquire_with_retry(backend) as conn:
+            archive = await export_bank(conn, source)
+        # Source bank is left in place — this is the same-instance "make a copy" flow.
+        result = await memory.import_bank_async(archive, request_context, target_bank_id=target)
+        assert result.bank_id == target
+        assert result.mental_models_imported == 1
+
+        async with acquire_with_retry(backend) as conn:
+            target_internal_id = await conn.fetchval(
+                f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", target
+            )
+        # The copy exists (parent row landed) and got a fresh, non-colliding id.
+        assert target_internal_id is not None
+        assert target_internal_id != source_internal_id
+    finally:
+        await memory.delete_bank(source, request_context=request_context)
+        await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
 async def test_bank_roundtrip_carries_mental_model_history(memory, request_context):
     """Mental-model refresh history survives export/import. Mental models keep a
     stable (id, bank_id), so the dedicated mental_model_history rows are carried
@@ -1690,10 +1738,56 @@ async def test_purge_expired_export_archives(memory, request_context):
                 old,
                 uuid.UUID(op_id),
             )
-            purged = await memory.purge_expired_export_archives(conn, fq_table("async_operations"), cutoff)
+            purged = await memory.purge_expired_export_archives(
+                conn, fq_table("async_operations"), cutoff, batch_size=100
+            )
         assert purged >= 1
         with pytest.raises(FileNotFoundError):
             await memory._file_storage.retrieve(storage_key)
+    finally:
+        await memory.delete_bank(bank, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_export_archives_honours_the_batch_bound(memory, request_context):
+    """The purge deletes at most ``batch_size`` archives per call.
+
+    Unbounded, it re-selected every expired export on every cleanup cycle and
+    re-issued a blob delete for each — ``storage_key`` stays in the row until the
+    row itself is pruned, so nothing marks an archive as already handled. The
+    prune next to it is batched, so the purge shares that bound and the two walk
+    the same ``ORDER BY updated_at, operation_id`` window together.
+    """
+    from datetime import timedelta
+
+    bank = _unique_bank("export_purge_bound")
+    try:
+        await memory.get_bank_profile(bank_id=bank, request_context=request_context)
+        backend = await memory._get_backend()
+        # Fabricated rows rather than real exports: the purge counts rows carrying a
+        # storage_key and swallows the blob delete, so no archive needs to exist for
+        # the bound to be observable. Backdated far past any other test's rows so the
+        # ORDER BY puts these first on the shared pg0 database.
+        old = datetime.now(timezone.utc) - timedelta(days=500)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+        async with acquire_with_retry(backend) as conn:
+            for i in range(2):
+                await conn.execute(
+                    f"""INSERT INTO {fq_table("async_operations")}
+                        (operation_id, bank_id, operation_type, status, task_payload,
+                         result_metadata, updated_at)
+                        VALUES ($1, $2, 'export_documents', 'completed', '{{}}'::jsonb, $3::jsonb, $4)""",
+                    uuid.uuid4(),
+                    bank,
+                    json.dumps({"storage_key": f"banks/{bank}/exports/absent-{i}.zip"}),
+                    old,
+                )
+            # LIMIT 1 caps the result at one row regardless of which expired export
+            # sorts first, so this holds even with other tests' rows in the schema.
+            purged = await memory.purge_expired_export_archives(
+                conn, fq_table("async_operations"), cutoff, batch_size=1
+            )
+        assert purged == 1
     finally:
         await memory.delete_bank(bank, request_context=request_context)
 

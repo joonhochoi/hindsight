@@ -232,7 +232,7 @@ export type BankConfigUpdate = {
   /**
    * Updates
    *
-   * Configuration overrides. Keys can be in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER). Only hierarchical fields can be overridden per-bank.
+   * Configuration overrides. Keys can be in Python field format (retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE). Only hierarchical fields can be overridden per-bank.
    */
   updates: {
     [key: string]: unknown;
@@ -420,13 +420,13 @@ export type BankStatsResponse = {
   /**
    * Last Memory Write At
    *
-   * When a memory was last written in this bank — stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_refreshed_at` is at or after this is up to date whatever its tags; an older one may need a refresh, which only the single mental-model read can confirm.
+   * When a memory was last written in this bank — stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after this is up to date whatever its tags; an older one may need a refresh, which only the single mental-model read can confirm.
    */
   last_memory_write_at?: string | null;
   /**
    * Pending Consolidation
    *
-   * Number of memories not yet processed into observations
+   * Number of source memories (world/experience) still queued for consolidation into observations. Excludes memories whose consolidation permanently failed — those are counted only in failed_consolidation — so this drains to 0 when the consolidator catches up.
    */
   pending_consolidation?: number;
   /**
@@ -1252,7 +1252,7 @@ export type CreateDirectiveRequest = {
   /**
    * Tags
    *
-   * Tags for filtering
+   * Directive execution scope. Empty means global; non-empty requires a matching reflect scope.
    */
   tags?: Array<string>;
 };
@@ -1494,6 +1494,24 @@ export type DirectiveListResponse = {
    * Items
    */
   items: Array<DirectiveResponse>;
+  /**
+   * Total
+   *
+   * Total number of directives matching the filter (not just this page)
+   */
+  total: number;
+  /**
+   * Limit
+   *
+   * Page size that was applied
+   */
+  limit: number;
+  /**
+   * Offset
+   *
+   * Offset that was applied
+   */
+  offset: number;
 };
 
 /**
@@ -3236,6 +3254,24 @@ export type MentalModelListResponse = {
    * Items
    */
   items: Array<MentalModelResponse>;
+  /**
+   * Total
+   *
+   * Total number of mental models matching the filter (not just this page)
+   */
+  total: number;
+  /**
+   * Limit
+   *
+   * Page size that was applied
+   */
+  limit: number;
+  /**
+   * Offset
+   *
+   * Offset that was applied
+   */
+  offset: number;
 };
 
 /**
@@ -3377,19 +3413,19 @@ export type MentalModelRefreshWindow = {
   /**
    * Created After
    *
-   * Lower bound on memory creation time. Set only in delta mode, where it is the model's last_refreshed_at — so a delta refresh only sees memories newer than the last one.
+   * Lower bound on when a memory last changed. Set only in delta mode, where it is the model's last_memory_seen_at — so a delta refresh only sees memories written or edited since the newest one the previous refresh saw.
    */
   created_after?: string | null;
   /**
    * Created Before
    *
-   * Database-time snapshot bounding the refresh. Memories committed after this are not read, so they stay newer than the persisted watermark and are caught by the next refresh.
+   * Database-time snapshot bounding the refresh. Memories written or edited after this are not read, so they stay newer than the persisted watermark and are caught by the next refresh.
    */
   created_before: string;
   /**
    * Watermark
    *
-   * The last_refreshed_at a real refresh would persist: the newest in-scope memory visible at the snapshot, not now(). Null means no in-scope memory was visible.
+   * The last_memory_seen_at a real refresh would persist: the newest in-scope memory visible at the snapshot, not now(). Null means no in-scope memory was visible.
    */
   watermark?: string | null;
 };
@@ -3433,8 +3469,16 @@ export type MentalModelResponse = {
   trigger?: MentalModelTriggerOutput | null;
   /**
    * Last Refreshed At
+   *
+   * When a refresh last finished for this model — wall-clock, in ISO format. Advances on every refresh that completes, including one that found nothing new and preserved the content, and on a direct edit of `content`. A refresh that failed leaves it alone. This is the field to answer 'have I already refreshed this?'; it says nothing about whether the model is behind the data, which is `last_memory_seen_at` / `is_stale`.
    */
   last_refreshed_at?: string | null;
+  /**
+   * Last Memory Seen At
+   *
+   * How far through the bank's memories this model is written — the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. Compare against `last_memory_write_at` from GET /stats to flag a whole list cheaply: at or after it means up to date, older means it may need a refresh. Null for a model no refresh has stamped yet.
+   */
+  last_memory_seen_at?: string | null;
   /**
    * Created At
    */
@@ -3450,7 +3494,7 @@ export type MentalModelResponse = {
   /**
    * Is Stale
    *
-   * True when memories matching this mental model's tag/fact_type scope have been written since last_refreshed_at. Exact, and costly to compute, so it is populated only by the single mental-model read at detail=full — never when listing. For a whole list, compare each `last_refreshed_at` against the bank's `last_memory_write_at` from GET /stats: at or after it means up to date, older means it may need a refresh.
+   * True when memories matching this mental model's tag/fact_type scope have been written since last_memory_seen_at. Exact, and costly to compute, so it is populated only by the single mental-model read at detail=full — never when listing. For a whole list, compare each `last_memory_seen_at` against the bank's `last_memory_write_at` from GET /stats: at or after it means up to date, older means it may need a refresh.
    */
   is_stale?: boolean | null;
 };
@@ -3847,6 +3891,12 @@ export type OperationResponse = {
    */
   filename?: string | null;
   /**
+   * Mental Model Id
+   *
+   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata. The single-operation read exposes the same value under `result_metadata`.
+   */
+  mental_model_id?: string | null;
+  /**
    * Created At
    */
   created_at: string;
@@ -4089,6 +4139,12 @@ export type RecallResponse = {
   source_facts?: {
     [key: string]: RecallResult;
   } | null;
+  /**
+   * Source Facts Truncated
+   *
+   * Whether the source_facts map was cut short by the token budget. When true, some IDs in results[].source_fact_ids have no entry in source_facts — the budget ran out, the references are not dangling. Only set when source facts were requested.
+   */
+  source_facts_truncated?: boolean | null;
 };
 
 /**
@@ -4392,19 +4448,19 @@ export type ReflectRequest = {
   /**
    * Tags
    *
-   * Filter memories by tags during reflection. If not specified, all memories are considered.
+   * Scope raw facts, observations, mental models, and tagged directives during reflection. With no tags, memory retrieval is unfiltered while only untagged/global directives are loaded. Use tags=[] with tags_match='exact' to select the untagged/global scope.
    */
   tags?: Array<string> | null;
   /**
    * Tags Match
    *
-   * How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).
+   * How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), or 'exact' (set equality). Untagged directives remain global in every mode.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
   /**
    * Tag Groups
    *
-   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags.
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
@@ -5023,6 +5079,10 @@ export type UpdateNodeRequest = {
    * Max Tokens
    */
   max_tokens?: number | null;
+  /**
+   * Refresh settings to change. Applied as a patch: only the fields present in this object are updated, and the rest keep the page's current values — so moving a page onto a schedule does not reset how it refreshes. Setting refresh_cron clears refresh_after_consolidation and vice versa, since a page refreshes on one or the other, never both.
+   */
+  trigger?: MentalModelTriggerInput | null;
 };
 
 /**
@@ -6779,13 +6839,13 @@ export type ListDirectivesData = {
     /**
      * Tags
      *
-     * Filter by tags
+     * Filter directives by execution scope. Omit or pass [] to list all directives.
      */
     tags?: Array<string> | null;
     /**
      * Tags Match
      *
-     * How to match tags
+     * How tagged directives match the requested scope. Untagged/global directives are included.
      */
     tags_match?: "any" | "all" | "exact";
     /**

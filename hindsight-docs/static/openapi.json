@@ -10,7 +10,7 @@
       "name": "Apache 2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
-    "version": "0.9.0"
+    "version": "0.9.1"
   },
   "paths": {
     "/health": {
@@ -2587,7 +2587,7 @@
           "Knowledge Base"
         ],
         "summary": "Rename/move a knowledge-base node or update a page's options",
-        "description": "Rename a node (set `name`), move it under another folder (set `parent_id`, null for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`). Changing `source_query` schedules an async refresh so the page rebuilds against the new question.",
+        "description": "Rename a node (set `name`), move it under another folder (set `parent_id`, null for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`, `trigger`). Changing `source_query` schedules an async refresh so the page rebuilds against the new question. `trigger` is applied as a patch: the fields you send are updated and the rest keep the page's current values.",
         "operationId": "update_knowledge_node",
         "parameters": [
           {
@@ -2729,7 +2729,7 @@
           "Directives"
         ],
         "summary": "List directives",
-        "description": "List hard rules that are injected into prompts.",
+        "description": "List directive definitions. Unlike reflect, an omitted tag filter returns all directives.",
         "operationId": "list_directives",
         "parameters": [
           {
@@ -2757,10 +2757,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter by tags",
+              "description": "Filter directives by execution scope. Omit or pass [] to list all directives.",
               "title": "Tags"
             },
-            "description": "Filter by tags"
+            "description": "Filter directives by execution scope. Omit or pass [] to list all directives."
           },
           {
             "name": "tags_match",
@@ -2773,11 +2773,11 @@
                 "exact"
               ],
               "type": "string",
-              "description": "How to match tags",
+              "description": "How tagged directives match the requested scope. Untagged/global directives are included.",
               "default": "any",
               "title": "Tags Match"
             },
-            "description": "How to match tags"
+            "description": "How tagged directives match the requested scope. Untagged/global directives are included."
           },
           {
             "name": "active_only",
@@ -2859,7 +2859,7 @@
           "Directives"
         ],
         "summary": "Create directive",
-        "description": "Create a hard rule that will be injected into prompts.",
+        "description": "Create a global or tag-scoped hard rule for reflect prompts.",
         "operationId": "create_directive",
         "parameters": [
           {
@@ -5365,7 +5365,7 @@
           "Banks"
         ],
         "summary": "Update bank configuration",
-        "description": "Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).",
+        "description": "Update configuration overrides for a bank. Only hierarchical behavioral settings can be overridden (retention parameters, recall settings, etc.). Keys can be provided in Python field format (retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE).",
         "operationId": "update_bank_config",
         "parameters": [
           {
@@ -7065,12 +7065,10 @@
         "example": {
           "bank_id": "my-bank",
           "config": {
-            "llm_model": "gpt-4",
-            "llm_provider": "openai",
+            "retain_chunk_size": 3000,
             "retain_extraction_mode": "verbose"
           },
           "overrides": {
-            "llm_model": "gpt-4",
             "retain_extraction_mode": "verbose"
           }
         }
@@ -7081,7 +7079,7 @@
             "additionalProperties": true,
             "type": "object",
             "title": "Updates",
-            "description": "Configuration overrides. Keys can be in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER). Only hierarchical fields can be overridden per-bank."
+            "description": "Configuration overrides. Keys can be in Python field format (retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE). Only hierarchical fields can be overridden per-bank."
           }
         },
         "type": "object",
@@ -7092,9 +7090,8 @@
         "description": "Request model for updating bank configuration.",
         "example": {
           "updates": {
-            "llm_model": "claude-sonnet-4-5",
             "retain_custom_instructions": "Extract technical details carefully",
-            "retain_extraction_mode": "verbose"
+            "retain_extraction_mode": "custom"
           }
         }
       },
@@ -7409,12 +7406,12 @@
               }
             ],
             "title": "Last Memory Write At",
-            "description": "When a memory was last written in this bank \u2014 stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_refreshed_at` is at or after this is up to date whatever its tags; an older one may need a refresh, which only the single mental-model read can confirm."
+            "description": "When a memory was last written in this bank \u2014 stored, edited, or consolidated (ISO format). Null if the bank has no memories. A mental model whose `last_memory_seen_at` is at or after this is up to date whatever its tags; an older one may need a refresh, which only the single mental-model read can confirm."
           },
           "pending_consolidation": {
             "type": "integer",
             "title": "Pending Consolidation",
-            "description": "Number of memories not yet processed into observations",
+            "description": "Number of source memories (world/experience) still queued for consolidation into observations. Excludes memories whose consolidation permanently failed \u2014 those are counted only in failed_consolidation \u2014 so this drains to 0 when the consolidator catches up.",
             "default": 0
           },
           "failed_consolidation": {
@@ -8837,7 +8834,7 @@
             },
             "type": "array",
             "title": "Tags",
-            "description": "Tags for filtering",
+            "description": "Directive execution scope. Empty means global; non-empty requires a matching reflect scope.",
             "default": []
           }
         },
@@ -9224,11 +9221,29 @@
             },
             "type": "array",
             "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total number of directives matching the filter (not just this page)"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "description": "Page size that was applied"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset",
+            "description": "Offset that was applied"
           }
         },
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "total",
+          "limit",
+          "offset"
         ],
         "title": "DirectiveListResponse",
         "description": "Response model for listing directives."
@@ -12001,11 +12016,29 @@
             },
             "type": "array",
             "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total number of mental models matching the filter (not just this page)"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "description": "Page size that was applied"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset",
+            "description": "Offset that was applied"
           }
         },
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "total",
+          "limit",
+          "offset"
         ],
         "title": "MentalModelListResponse",
         "description": "Response model for listing mental models."
@@ -12232,13 +12265,13 @@
               }
             ],
             "title": "Created After",
-            "description": "Lower bound on memory creation time. Set only in delta mode, where it is the model's last_refreshed_at \u2014 so a delta refresh only sees memories newer than the last one."
+            "description": "Lower bound on when a memory last changed. Set only in delta mode, where it is the model's last_memory_seen_at \u2014 so a delta refresh only sees memories written or edited since the newest one the previous refresh saw."
           },
           "created_before": {
             "type": "string",
             "format": "date-time",
             "title": "Created Before",
-            "description": "Database-time snapshot bounding the refresh. Memories committed after this are not read, so they stay newer than the persisted watermark and are caught by the next refresh."
+            "description": "Database-time snapshot bounding the refresh. Memories written or edited after this are not read, so they stay newer than the persisted watermark and are caught by the next refresh."
           },
           "watermark": {
             "anyOf": [
@@ -12251,7 +12284,7 @@
               }
             ],
             "title": "Watermark",
-            "description": "The last_refreshed_at a real refresh would persist: the newest in-scope memory visible at the snapshot, not now(). Null means no in-scope memory was visible."
+            "description": "The last_memory_seen_at a real refresh would persist: the newest in-scope memory visible at the snapshot, not now(). Null means no in-scope memory was visible."
           }
         },
         "type": "object",
@@ -12336,7 +12369,20 @@
                 "type": "null"
               }
             ],
-            "title": "Last Refreshed At"
+            "title": "Last Refreshed At",
+            "description": "When a refresh last finished for this model \u2014 wall-clock, in ISO format. Advances on every refresh that completes, including one that found nothing new and preserved the content, and on a direct edit of `content`. A refresh that failed leaves it alone. This is the field to answer 'have I already refreshed this?'; it says nothing about whether the model is behind the data, which is `last_memory_seen_at` / `is_stale`."
+          },
+          "last_memory_seen_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Memory Seen At",
+            "description": "How far through the bank's memories this model is written \u2014 the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. Compare against `last_memory_write_at` from GET /stats to flag a whole list cheaply: at or after it means up to date, older means it may need a refresh. Null for a model no refresh has stamped yet."
           },
           "created_at": {
             "anyOf": [
@@ -12372,7 +12418,7 @@
               }
             ],
             "title": "Is Stale",
-            "description": "True when memories matching this mental model's tag/fact_type scope have been written since last_refreshed_at. Exact, and costly to compute, so it is populated only by the single mental-model read at detail=full \u2014 never when listing. For a whole list, compare each `last_refreshed_at` against the bank's `last_memory_write_at` from GET /stats: at or after it means up to date, older means it may need a refresh."
+            "description": "True when memories matching this mental model's tag/fact_type scope have been written since last_memory_seen_at. Exact, and costly to compute, so it is populated only by the single mental-model read at detail=full \u2014 never when listing. For a whole list, compare each `last_memory_seen_at` against the bank's `last_memory_write_at` from GET /stats: at or after it means up to date, older means it may need a refresh."
           }
         },
         "type": "object",
@@ -13038,6 +13084,18 @@
             "title": "Filename",
             "description": "Original filename for file-conversion operations (file_convert_retain); null for other task types."
           },
+          "mental_model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mental Model Id",
+            "description": "Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed \u2014 `document_id` is null for these, and the list carries no result_metadata. The single-operation read exposes the same value under `result_metadata`."
+          },
           "created_at": {
             "type": "string",
             "title": "Created At"
@@ -13286,7 +13344,7 @@
           "completed_at": "2024-01-15T10:31:30Z",
           "created_at": "2024-01-15T10:30:00Z",
           "operation_id": "550e8400-e29b-41d4-a716-446655440000",
-          "operation_type": "refresh_mental_models",
+          "operation_type": "refresh_mental_model",
           "status": "completed",
           "updated_at": "2024-01-15T10:31:30Z"
         }
@@ -13335,6 +13393,7 @@
             {
               "created_at": "2024-01-15T10:30:00Z",
               "id": "550e8400-e29b-41d4-a716-446655440000",
+              "items_count": 5,
               "status": "pending",
               "task_type": "retain"
             }
@@ -13560,6 +13619,18 @@
             ],
             "title": "Source Facts",
             "description": "Source facts for observation-type results, keyed by fact ID"
+          },
+          "source_facts_truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Facts Truncated",
+            "description": "Whether the source_facts map was cut short by the token budget. When true, some IDs in results[].source_fact_ids have no entry in source_facts \u2014 the budget ran out, the references are not dangling. Only set when source facts were requested."
           }
         },
         "type": "object",
@@ -14143,7 +14214,7 @@
               }
             ],
             "title": "Tags",
-            "description": "Filter memories by tags during reflection. If not specified, all memories are considered."
+            "description": "Scope raw facts, observations, mental models, and tagged directives during reflection. With no tags, memory retrieval is unfiltered while only untagged/global directives are loaded. Use tags=[] with tags_match='exact' to select the untagged/global scope."
           },
           "tags_match": {
             "type": "string",
@@ -14155,7 +14226,7 @@
               "exact"
             ],
             "title": "Tags Match",
-            "description": "How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
+            "description": "How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), or 'exact' (set equality). Untagged directives remain global in every mode.",
             "default": "any"
           },
           "tag_groups": {
@@ -14184,7 +14255,7 @@
               }
             ],
             "title": "Tag Groups",
-            "description": "Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}."
+            "description": "Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags."
           },
           "apply_all_directives": {
             "type": "boolean",
@@ -15329,6 +15400,17 @@
               }
             ],
             "title": "Max Tokens"
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MentalModelTrigger-Input"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Refresh settings to change. Applied as a patch: only the fields present in this object are updated, and the rest keep the page's current values \u2014 so moving a page onto a schedule does not reset how it refreshes. Setting refresh_cron clears refresh_after_consolidation and vice versa, since a page refreshes on one or the other, never both."
           }
         },
         "type": "object",
@@ -15464,14 +15546,18 @@
         "title": "VersionResponse",
         "description": "Response model for the version/info endpoint.",
         "example": {
-          "api_version": "0.4.0",
+          "api_version": "0.9.0",
           "features": {
+            "audit_log": false,
             "bank_config_api": false,
+            "bank_llm_health": true,
             "document_export_api": true,
             "document_import_api": true,
             "file_upload_api": true,
+            "llm_trace": false,
             "mcp": true,
             "observations": false,
+            "store_document_text": true,
             "worker": true
           }
         }

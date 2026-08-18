@@ -4,7 +4,7 @@
 
 Long-term project memory for **coding agents**, backed by [Hindsight](https://vectorize.io/hindsight).
 One package, several agents: a shared reflect-and-inject core with a thin entry point per agent
-(**opencode**, **Kilo CLI**, **Cline CLI**, **Claude Code**, **Codex CLI**, **Antigravity CLI**, **Cursor CLI**, **GitHub Copilot CLI**, **Grok Build**). Ingestion is fully
+(**opencode**, **Kilo CLI**, **Cline CLI**, **Prime Agent**, **DeepSeek Harness**, **Claude Code**, **Codex CLI**, **Antigravity CLI**, **Cursor CLI**, **GitHub Copilot CLI**, **Grok Build**). Ingestion is fully
 automatic — there is no setup command: a repo's git history and conversations flow into its memory
 bank in the background as you work.
 
@@ -114,6 +114,29 @@ npx @vectorize-io/hindsight-coding-agents install cline-cli
 
 A native plugin via `cline plugin install`, plus MCP and the companion skill.
 
+####  Prime Agent
+
+```bash
+npx @vectorize-io/hindsight-coding-agents install prime-agent
+```
+
+An extension entry in `~/.prime/agent/settings.json` — native tools, no MCP needed.
+
+####  DeepSeek Harness
+
+```bash
+npx @vectorize-io/hindsight-coding-agents install dsh
+```
+
+A Cordis plugin row in `$DSH_HOME/cordis.patch.yml` (`~/.dsh` by default), which every dsh profile
+composes — native tools, no MCP needed. Two dsh-specific notes: one dsh process serves **several
+repositories** (its Web UI opens each session in whatever directory you pick), so the bank is
+resolved per session workspace rather than once per process; and dsh has no plugin-facing notice
+channel, so the seed line goes to the plugin log rather than the UI. Everything model-facing —
+recalled memory, the knowledge preamble, the `hindsight_*` tools — is unaffected. If you prefer the
+published-package route, `dsh plugin --profile web add @vectorize-io/hindsight-coding-agents` works
+too: the package ships the profile patch layer, so nothing else needs editing.
+
 Uninstall the same way: `npx @vectorize-io/hindsight-coding-agents uninstall claude-code` (or `uninstall all`).
 
 **Devin CLI needs Node 22.5 or newer.** Its hooks pass only a session id — the conversation itself
@@ -147,7 +170,8 @@ minimal, hand-wired setup.
 
 Adding an agent: hook-based → write a `HookSpec` entry point (see `src/cursor-hook.ts`) and register
 a `hookAdapter` in `src/harness/registry.ts`; persistent-plugin → implement `HarnessAdapter`
-(`src/core/types.ts`) fully (see `src/harness/opencode.ts`).
+(`src/core/types.ts`) fully (see `src/harness/opencode.ts`), or bind the host's own plugin API to
+`RuntimeCore` directly when it is not an opencode fork (see `src/cline.ts`, `src/dsh.ts`).
 
 ## Migrating from the per-agent plugins
 
@@ -180,12 +204,14 @@ transcripts are needed either way; going through them directly is simply the sho
 
 **How sessions are matched.** A conversation is imported only when the session itself records the
 directory it ran in — never inferred from a file or folder name. Claude Code writes that directory
-on its entries and Codex in its `session_meta` header, so both can be attributed exactly, including
-sessions started in a subdirectory of the repo. Guessing was tempting (Claude names its history
+on its entries, Codex in its `session_meta` header and DeepSeek Harness in its session-log header,
+so all three can be attributed exactly, including sessions started in a subdirectory of the repo. Guessing was tempting (Claude names its history
 folders after the project path) but unsafe: `/` and `.` both encode to `-`, so `repo-sub` is either
 the subdirectory `repo/sub` or an unrelated sibling repo — and a wrong guess files someone else's
 conversation into your bank. Sessions that record nothing are skipped and the count is reported.
-The other harnesses (opencode, Kilo, Cursor, Cline, Copilot, Devin) keep history in internal SQLite
+DeepSeek Harness logs are Zstandard-framed JSONL under `$DSH_HOME/sessions`, which needs Node 22.15+
+to read; an older Node skips the import with that reason rather than silently importing nothing. The
+other harnesses (opencode, Kilo, Cursor, Cline, Copilot, Devin) keep history in internal SQLite
 databases with unversioned schemas and are skipped with a reason.
 
 **Nothing else is translated.** The old plugin's behavioural settings — 12 `recall*`, 7 `retain*`,
@@ -227,9 +253,9 @@ Nothing to sign up for and nothing to host — memory runs on your machine. The 
   A session that begins before it is ready simply has no memory for a turn or two — a daemon that
   isn't up is treated as an unreachable server, exactly like a Cloud or self-hosted outage, with the
   same error handling and the same diagnostics. Nothing downstream of the URL knows which mode it is.
-- **It shuts down on idle**, after `daemonIdleTimeout` seconds. There is deliberately no
-  stop-on-exit: one daemon is shared, so ending one session must not cut memory out from under
-  another agent still working.
+- **It keeps running** until you stop it. There is deliberately no stop-on-exit: one daemon is
+  shared, so ending one session must not cut memory out from under another agent still working.
+  Set `daemonIdleTimeout` to have it exit after that many seconds of inactivity.
 - **macOS additionally needs a current Rust toolchain.** `litellm` (a transitive dependency of the
   API) publishes wheels only for Linux and Windows, so a Mac compiles it from source through
   maturin and its crates pin a recent `rustc`. Install from [rustup.rs](https://rustup.rs) and keep
@@ -246,7 +272,7 @@ environment carries over unchanged:
 | ------------------- | ------------------------------- | -------------- | ------------------------------------------ |
 | `serverMode`        | `HINDSIGHT_SERVER_MODE`         | `cloud`        | `cloud` \| `self-hosted` \| `daemon`       |
 | `apiPort`           | `HINDSIGHT_API_PORT`            | `9077`         | port the local daemon listens on           |
-| `daemonIdleTimeout` | `HINDSIGHT_DAEMON_IDLE_TIMEOUT` | `300`          | seconds of inactivity before it exits      |
+| `daemonIdleTimeout` | `HINDSIGHT_DAEMON_IDLE_TIMEOUT` | —              | seconds of inactivity before it exits      |
 | `daemonProfile`     | `HINDSIGHT_DAEMON_PROFILE`      | `coding-agent` | which local database it uses               |
 | `embedVersion`      | `HINDSIGHT_EMBED_VERSION`       | `latest`       | which `hindsight-embed` release to run     |
 | `embedPackagePath`  | `HINDSIGHT_EMBED_PACKAGE_PATH`  | —              | run a local checkout instead (development) |
@@ -268,7 +294,34 @@ Environment variables are a **fallback**: the file wins wherever it sets a value
 an existing setup changes nothing. `retainTags` takes a comma-separated list
 (`HINDSIGHT_RETAIN_TAGS="project:{gitProject},env:work"`); entries are trimmed and blanks dropped.
 The map-valued settings (`mapPathToBank`, `harnesses`, `banks`, `retainMetadata`) are file-only —
-per-key branching doesn't survive flattening into one variable.
+per-key branching doesn't survive flattening into one variable. `maxParallelRetains` is available
+as `HINDSIGHT_MAX_PARALLEL_RETAINS` for containers and CI.
+
+### Opt-in only
+
+By default every project gets memory — that is what makes the plugin zero-setup. If you would
+rather nothing be remembered until you say so, turn memory off everywhere and name the projects
+that may use it:
+
+```jsonc
+{
+  "optInOnly": true,
+  "optInPaths": ["~/work/client-x", "~/oss"],
+}
+```
+
+Anything outside those paths is **inert**: no bank is created, nothing is retained, no seed runs,
+and the agent behaves exactly as it would without the plugin. Approving costs nothing else —
+`optInPaths` says _which projects_, not _which bank_, so an approved repo keeps its usual
+`coding-agent::{gitProject}` name. Paths are prefixes, so approving `~/work` approves every repo
+under it while each still gets its own bank.
+
+A `mapPathToBank` entry counts as opted in too, since routing a path to a named bank already
+declares that project. A bare `bankId` does not: it names a bank rather than a project, so it
+cannot say which work may be remembered, and a privacy switch has to fail closed.
+
+There is no per-repo opt-in file, for the same reason there is no repo-carried config at all: a
+cloned repository must not be able to turn memory on.
 
 There is deliberately no repo-carried config file — per-repo bank routing is `mapPathToBank`,
 per-agent differences are `harnesses.<name>`.
@@ -296,9 +349,11 @@ hook by Codex...), so one shared config serves several agents side by side:
 | `dynamicBankId`         | dynamic iff no `bankId`              | force dynamic (`true`) or static (`false`) resolution                                                                                                                                                                               |
 | `bankIdTemplate`        | `"coding-agent::{gitProject}"`       | dynamic bank id format; the default makes every agent share one bank per repo                                                                                                                                                       |
 | `mapPathToBank`         | —                                    | absolute path → bank; **longest prefix wins**; overrides everything                                                                                                                                                                 |
+| `optInOnly`             | `false`                              | run memory ONLY in opted-in projects — everything else is inert, with no bank created; see Opt-in only                                                                                                              |
+| `optInPaths`            | —                                    | directories opted in, matched as prefixes with `~` expanded; each repo beneath keeps its own dynamic bank                                                                                                                           |
 | `resolveWorktrees`      | `true`                               | `{gitProject}`: linked worktrees share the main repo's bank                                                                                                                                                                         |
-| `retainTags`            | —                                    | extra tags on every session write-back, e.g. `["project:{gitProject}"]` — see **Recording where a memory came from** below                                                                                                          |
-| `retainMetadata`        | —                                    | extra metadata on every session write-back, e.g. `{"repo": "{gitProject}"}`                                                                                                                                                         |
+| `retainTags`            | —                                    | extra tags on every document written by the integration, e.g. `["project:{gitProject}"]` — see **Recording where a memory came from** below                                                                                         |
+| `retainMetadata`        | —                                    | extra metadata on every document written by the integration, e.g. `{"repo": "{gitProject}"}`                                                                                                                                        |
 | `disabled`              | `false`                              | hard off-switch (inert plugin/hook — a no-memory baseline)                                                                                                                                                                          |
 | `reflectTimeoutMs`      | `120000`                             | session-reflect timeout (hook harnesses additionally cap it at 25s to fit the host's hook window); on timeout the session runs without reflect (recorded)                                                                           |
 | `pageRefreshEveryTurns` | `10`                                 | refetch the knowledge pages and re-inject the page roster + tool guide every N user turns                                                                                                                                           |
@@ -308,7 +363,7 @@ hook by Codex...), so one shared config serves several agents side by side:
 | `surveyModel`           | `haiku`                              | model for the survey — Claude recipe only (`claude -p --model`); other agents use their configured default                                                                                                                          |
 | `surveyBudgetUsd`       | `2`                                  | survey spend cap — Claude recipe only (`claude -p --max-budget-usd`); other agents rely on their read-only sandbox                                                                                                                  |
 | `retainSessions`        | `true`                               | plugin-harness write-back (opencode, Kilo): async upsert of the session transcript every turn, plus an idle flush that captures the reply the per-turn pass can't see (set `false` to opt out; hook harnesses always write on Stop) |
-| `retainEveryTurns`      | `1`                                  | opencode write-back cadence (user turns)                                                                                                                                                                                            |
+| `maxParallelRetains`    | `10`                                 | cap on concurrent retain-related requests: drain()'s per-op polls plus deepen's chat/git retain pools. The API rate-limits bursts, not single requests — if you see 429s, lower this rather than raising it                         |
 | `logLevel`              | `"info"`                             | plugin-log verbosity (`"debug"` \| `"info"` \| `"warn"` \| `"error"`); `HINDSIGHT_LOG_LEVEL` env overrides                                                                                                                          |
 | `gitIngest`             | `"message"`                          | git depth for seeding AND staying current (same engine): `"message"` = commit messages only (one doc, re-upserted when HEAD moves); `"full"` = messages + per-commit full diffs (progressive, newest first); `"none"` = git off     |
 | `harnesses.<name>`      | —                                    | per-harness override of any field above                                                                                                                                                                                             |
@@ -385,8 +440,9 @@ all share one memory per repo — use `"{harness}-{gitProject}"` to split per ag
 
 With a bank per repo, the bank _is_ the answer to "where did this come from". On a deliberately
 **shared** bank — one bank holding cross-project knowledge so facts recall everywhere — it isn't:
-every memory looks alike. `retainTags` and `retainMetadata` stamp that provenance onto each session
-write-back:
+every memory looks alike. `retainTags` and `retainMetadata` stamp that provenance onto conversations,
+git history and diffs, survey lifecycle documents, initiative markers, and documents saved through
+`hindsight_ingest_document`:
 
 ```jsonc
 {
@@ -400,6 +456,7 @@ Recalls can then filter by `project:<repo>`, and every document shows which repo
 of. Both accept the same placeholders as `bankIdTemplate` — `{gitProject}`, `{project}`,
 `{harness}`, `{channel}`, `{user}` — plus `{bankId}`, `{sessionId}` and `{timestamp}`.
 `{gitProject}` is worktree-aware here too, so every linked worktree of a repo stamps one name.
+`{sessionId}` resolves to `unknown` for documents that do not originate from an agent session.
 
 The plugin's own `source:` and `harness:` tags are reserved: entries in those namespaces are ignored
 with a warning, so a document's agent attribution always reflects the agent that actually wrote it.

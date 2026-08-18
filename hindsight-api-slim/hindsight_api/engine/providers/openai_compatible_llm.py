@@ -190,8 +190,8 @@ def _strip_code_fences(content: str) -> str:
 # Reasoning/thinking tags emitted by extended-thinking models. Some providers
 # (e.g. MiniMax-M3) leak the chain-of-thought wrapped in these tags into the
 # response body instead of a separate reasoning_content field. Each entry is
-# (open_tag, close_tag); the open tag also matches when the close tag is missing
-# (truncated output) so a dangling block is removed to end-of-string.
+# (open_tag, close_tag); a line-start open tag also matches when the close tag is
+# missing (truncated output) so a dangling block is removed to end-of-string.
 _REASONING_TAG_PAIRS: tuple[tuple[str, str], ...] = (
     ("<think>", "</think>"),
     ("<thinking>", "</thinking>"),
@@ -214,7 +214,11 @@ def _strip_reasoning_tags(text: str) -> str:
     Handles two cases:
     1. Closed blocks: ``<think>...</think>`` removed wherever they appear.
     2. Unclosed blocks: a dangling ``<think>`` with no closing tag (model output
-       truncated mid-thought) is removed from the open tag to end-of-string.
+       truncated mid-thought) is removed to end-of-string, but only when it starts
+       its own line (line-start, possibly indented). Inline occurrences (e.g. a
+       JSON value quoting ``<think>`` verbatim) are real content and must be kept
+       -- an unanchored greedy ``.*`` to end-of-string deleted every inline tag
+       plus all following content, surfacing as ``Unterminated string`` in retain.
 
     Returns the input unchanged (modulo surrounding whitespace) when no tags are
     present.
@@ -224,9 +228,14 @@ def _strip_reasoning_tags(text: str) -> str:
     for open_tag, close_tag in _REASONING_TAG_PAIRS:
         open_re = re.escape(open_tag)
         close_re = re.escape(close_tag)
-        # Closed blocks first, then any remaining unclosed (truncated) block.
+        # Closed blocks first.
         text = re.sub(rf"{open_re}.*?{close_re}", "", text, flags=re.DOTALL)
-        text = re.sub(rf"{open_re}.*", "", text, flags=re.DOTALL)
+        # Unclosed (truncated) blocks: strip only when the open tag starts its own
+        # line, from there to end-of-string. The line-start anchor preserves inline
+        # literals (e.g. a JSON value quoting ``<think>``) so valid JSON is not
+        # corrupted; DOTALL-to-end still removes a multi-line truncated block whole,
+        # so leaked reasoning does not survive past its first line.
+        text = re.sub(rf"(^|\n)[ \t]*{open_re}.*", "", text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -532,7 +541,7 @@ class OpenAICompatibleLLM(LLMInterface):
         api_key: str,
         base_url: str,
         model: str,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
         timeout: float | None = None,
         groq_service_tier: str | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -684,8 +693,18 @@ class OpenAICompatibleLLM(LLMInterface):
         self._client = AsyncOpenAI(**client_kwargs)
         logger.info(
             f"OpenAI-compatible client initialized: provider={self.provider}, model={self.model}, "
-            f"base_url={self.base_url or 'default'}"
+            f"base_url={self.base_url or 'default'}, "
+            f"reasoning_effort={self.reasoning_effort if self._sends_reasoning_effort() else 'not sent'}"
         )
+        if self.reasoning_effort is not None and not self._sends_reasoning_effort():
+            # Never drop a configured value silently: the variable is set, documented and
+            # visible in the environment, so every signal the operator has says it is in
+            # force. Saying so once at startup is what turns this into a seconds-long
+            # diagnosis instead of a source-reading exercise (issue #3449).
+            logger.warning(
+                f"reasoning_effort={self.reasoning_effort!r} is not sent to the model: "
+                f"{self.model!r} is a known non-reasoning model that rejects the parameter"
+            )
         logger.debug(
             f"Cache affinity resolved: provider={self.provider}, base_url={self.base_url or 'default'}, "
             f"mode={self._cache_affinity.value}"
@@ -727,8 +746,45 @@ class OpenAICompatibleLLM(LLMInterface):
         except Exception as e:
             raise RuntimeError(f"Connection verification failed for {self.provider}/{self.model}: {e}") from e
 
+    def _sends_reasoning_effort(self) -> bool:
+        """Whether ``reasoning_effort`` is attached to requests.
+
+        The operator decides, not a model name. ``provider=openai`` with a custom base_url
+        can serve any model under any name — vLLM, Ollama, llama.cpp, TGI — so the name
+        carries no capability signal, and gating on it made every
+        ``HINDSIGHT_API_*_REASONING_EFFORT`` variable a silent no-op on exactly those
+        deployments (issue #3449). Unset means unset: no level is invented for a model
+        just because its name is recognisable.
+        """
+        return self.reasoning_effort is not None and not self._rejects_reasoning_effort()
+
+    def _rejects_reasoning_effort(self) -> bool:
+        """Whether the model is a known product that rejects ``reasoning_effort`` outright.
+
+        The one place a name still overrides an explicit setting, and it matches only
+        OpenAI's own non-reasoning products — names invented by OpenAI, so a self-hosted
+        model is not going to collide with one by accident. Sending the parameter to
+        gpt-4o is an immediate HTTP 400, so honouring the setting there would trade a
+        silently ignored value for a hard failure. The drop is logged at startup.
+        """
+        model_lower = self.model.lower()
+        return any(x in model_lower for x in ["gpt-4o", "gpt-4.1", "gpt-4-", "gpt-3.5"])
+
     def _supports_reasoning_model(self) -> bool:
-        """Check if the current model is a reasoning model (o1, o3, GPT-5, DeepSeek)."""
+        """Check if the current model is a reasoning model (o1, o3, GPT-5, DeepSeek).
+
+        **Deprecated as a capability check — this list is frozen. Do not add models to
+        it.** Guessing capability from a name never worked outside OpenAI's own products:
+        ``provider=openai`` with a custom base_url serves anything under any name, so the
+        list could only ever grow stale while silently discarding what operators asked
+        for (issue #3449). Reasoning effort is now purely the operator's call, via
+        ``HINDSIGHT_API_LLM_REASONING_EFFORT`` and its per-operation variants — a new
+        model needs configuration, not a new substring here.
+
+        All that is left is the request *shape* a recognised OpenAI reasoning model
+        requires regardless of effort: the max-completion-tokens floor, the parameter
+        name, temperature suppression.
+        """
         model_lower = self.model.lower()
         if "deepseek" in model_lower:
             # DeepSeek v4-flash is the non-thinking route. Treating every
@@ -867,8 +923,8 @@ class OpenAICompatibleLLM(LLMInterface):
                 temperature = max(0.01, min(temperature, 1.0))
             call_params["temperature"] = temperature
 
-        # Set reasoning_effort for reasoning models
-        if is_reasoning_model:
+        # Set reasoning_effort when configured, or for models recognised as reasoning models
+        if self._sends_reasoning_effort():
             call_params["reasoning_effort"] = self.reasoning_effort
 
         # Provider-specific parameters
@@ -1304,7 +1360,7 @@ class OpenAICompatibleLLM(LLMInterface):
         # here is not a neutral default: OpenAI rejects function tools on a
         # reasoning model unless reasoning_effort is present and set to "none",
         # so leaving it out fails exactly like sending an unsupported value.
-        if self._supports_reasoning_model():
+        if self._sends_reasoning_effort():
             call_params["reasoning_effort"] = self.reasoning_effort
 
         # Provider-specific parameters

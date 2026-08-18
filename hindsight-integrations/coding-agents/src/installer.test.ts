@@ -254,6 +254,56 @@ describe("cline-cli installer", () => {
   });
 });
 
+describe("dsh installer", () => {
+  const patchPath = (ctx: InstallCtx) => join(ctx.home, ".dsh", "cordis.patch.yml");
+
+  // The harness home is env-driven; pin it to the test home so a developer's real $DSH_HOME
+  // (or a CI runner's) can never be the thing this suite writes to.
+  beforeEach(() => vi.stubEnv("DSH_HOME", ""));
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("registers the plugin as a file:// row in the home patch layer", () => {
+    const ctx = makeCtx();
+    expect(run(["install", "dsh"], ctx)).toBe(0);
+    const patch = readFileSync(patchPath(ctx), "utf8");
+    // A bare absolute path is not a module specifier: Cordis would fail to resolve it and skip
+    // the plugin silently, which is exactly the Kilo trap this asserts against.
+    expect(patch).toContain(`name: "${pathToFileURL(join(ctx.dist, "dsh.js")).href}"`);
+    expect(patch).toContain("- id: hindsight");
+  });
+
+  it("replaces its own block on re-install and preserves the user's other patches", () => {
+    const ctx = makeCtx();
+    mkdirSync(dirname(patchPath(ctx)), { recursive: true });
+    writeFileSync(patchPath(ctx), "- id: llm\n  config:\n    provider: deepseek\n");
+    run(["install", "dsh"], ctx);
+    run(["install", "dsh"], ctx);
+    const patch = readFileSync(patchPath(ctx), "utf8");
+    expect(patch).toContain("provider: deepseek");
+    expect(patch.match(/- id: hindsight/g)).toHaveLength(1);
+  });
+
+  it("uninstall leaves a valid empty patch list rather than an unparsable file", () => {
+    const ctx = makeCtx();
+    run(["install", "dsh"], ctx);
+    run(["uninstall", "dsh"], ctx);
+    // dsh REQUIRES this file to parse to a top-level array and fails BOOT otherwise, so an
+    // emptied file must still be `[]`.
+    expect(readFileSync(patchPath(ctx), "utf8").trim()).toBe("[]");
+  });
+
+  it("uninstall keeps the user's own patches", () => {
+    const ctx = makeCtx();
+    run(["install", "dsh"], ctx);
+    const kept = `- id: llm\n  config:\n    provider: deepseek\n`;
+    writeFileSync(patchPath(ctx), kept + readFileSync(patchPath(ctx), "utf8"));
+    run(["uninstall", "dsh"], ctx);
+    const patch = readFileSync(patchPath(ctx), "utf8");
+    expect(patch).toContain("provider: deepseek");
+    expect(patch).not.toContain("hindsight");
+  });
+});
+
 describe("antigravity-cli installer", () => {
   it("removes a namespace written under a PREVIOUS marker instead of leaving both live", () => {
     const ctx = makeCtx();
@@ -439,6 +489,40 @@ describe("opencode installer", () => {
   });
 });
 
+describe("prime-agent installer", () => {
+  const cfgPath = (ctx: InstallCtx) => join(ctx.home, ".prime", "agent", "settings.json");
+  const entry = (ctx: InstallCtx) => join(ctx.pkgRoot, "dist", "prime-agent.js");
+
+  it("install adds the built extension to the extensions array exactly once, even across reinstalls", () => {
+    const ctx = makeCtx();
+    expect(run(["install", "prime-agent"], ctx)).toBe(0);
+    run(["install", "prime-agent"], ctx);
+    expect(readJson(cfgPath(ctx)).extensions).toEqual([entry(ctx)]);
+  });
+
+  it("preserves other extension entries", () => {
+    const ctx = makeCtx();
+    writeJsonAt(cfgPath(ctx), { extensions: ["/some/other/ext.js"] });
+    run(["install", "prime-agent"], ctx);
+    expect(readJson(cfgPath(ctx)).extensions).toEqual(["/some/other/ext.js", entry(ctx)]);
+  });
+
+  it("uninstall removes our entry and deletes the extensions key when empty", () => {
+    const ctx = makeCtx();
+    run(["install", "prime-agent"], ctx);
+    run(["uninstall", "prime-agent"], ctx);
+    expect(readJson(cfgPath(ctx)).extensions).toBeUndefined();
+  });
+
+  it("uninstall keeps the extensions key when other entries remain", () => {
+    const ctx = makeCtx();
+    writeJsonAt(cfgPath(ctx), { extensions: ["/some/other/ext.js"] });
+    run(["install", "prime-agent"], ctx);
+    run(["uninstall", "prime-agent"], ctx);
+    expect(readJson(cfgPath(ctx)).extensions).toEqual(["/some/other/ext.js"]);
+  });
+});
+
 describe("cursor-cli installer", () => {
   const hooksPath = (ctx: InstallCtx) => join(ctx.home, ".cursor", "hooks.json");
   const mcpPath = (ctx: InstallCtx) => join(ctx.home, ".cursor", "mcp.json");
@@ -585,6 +669,7 @@ describe("run() CLI behavior", () => {
     expect(INSTALLERS.map((i) => i.name)).toEqual([
       "opencode",
       "kilo",
+      "prime-agent",
       "claude-code",
       "codex",
       "antigravity-cli",
@@ -593,6 +678,7 @@ describe("run() CLI behavior", () => {
       "copilot-cli",
       "grok-build",
       "cline-cli",
+      "dsh",
     ]);
   });
 });

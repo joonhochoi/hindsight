@@ -111,7 +111,7 @@ async def tool_search_mental_models(
         query_embedding: Pre-computed embedding for semantic search
         max_results: Maximum number of mental models to return
         tags: Optional tags to filter mental models
-        tags_match: How to match tags - "any" (OR), "all" (AND)
+        tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
         exclude_ids: Optional list of mental model IDs to exclude (e.g., when refreshing a mental model)
         last_memory_write_at: The bank's newest memory write, resolved once per reflect. Skips the
             per-model staleness query for any model refreshed at or after it.
@@ -150,7 +150,7 @@ async def tool_search_mental_models(
         f"""
         SELECT
             id, name, content,
-            tags, created_at, last_refreshed_at, trigger,
+            tags, created_at, last_refreshed_at, last_memory_seen_at, trigger,
             1 - (embedding <=> $2::vector) as relevance
         FROM {fq_table("mental_models")}
         WHERE bank_id = $1 AND embedding IS NOT NULL {filters}
@@ -167,6 +167,12 @@ async def tool_search_mental_models(
         if last_refreshed_at and last_refreshed_at.tzinfo is None:
             last_refreshed_at = last_refreshed_at.replace(tzinfo=timezone.utc)
 
+        # How far through the bank's memories this model is written — the cheap
+        # bank-wide check below compares against that, not against when it last ran.
+        last_memory_seen_at = row["last_memory_seen_at"] or last_refreshed_at
+        if last_memory_seen_at and last_memory_seen_at.tzinfo is None:
+            last_memory_seen_at = last_memory_seen_at.replace(tzinfo=timezone.utc)
+
         # Per-MM staleness: new in-scope memories since last refresh (includes pending).
         # The scoped query has no index to use and scans the bank's memories in full, so
         # skip it for a model the bank-wide watermark already proves current: nothing was
@@ -174,7 +180,7 @@ async def tool_search_mental_models(
         # model still gets the exact answer — the agent trusts a model without a verifying
         # recall() only on `is_stale is False`, so guessing conservatively here would buy
         # LLM turns to save a query. No watermark (absent, or an empty bank) → ask.
-        if last_memory_write_at is not None and not _may_need_refresh(last_refreshed_at, last_memory_write_at):
+        if last_memory_write_at is not None and not _may_need_refresh(last_memory_seen_at, last_memory_write_at):
             is_stale = False
         else:
             is_stale = await memory_engine.compute_mental_model_is_stale(conn, bank_id, row)
@@ -228,7 +234,7 @@ async def tool_search_observations(
         request_context: Request context for authentication
         max_tokens: Maximum tokens for results (default 5000)
         tags: Optional tags to filter observations
-        tags_match: How to match tags - "any" (OR), "all" (AND)
+        tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
         last_consolidated_at: When consolidation last ran (for staleness check)
         pending_consolidation: Number of memories waiting to be consolidated
         source_facts_max_tokens: Token budget for source facts (-1 = disabled, 0+ = enabled with limit)
@@ -318,7 +324,7 @@ async def tool_recall(
         request_context: Request context for authentication
         max_tokens: Maximum tokens for results (default 2048)
         tags: Filter by tags (includes untagged memories)
-        tags_match: How to match tags - "any" (OR), "all" (AND), or "exact"
+        tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
         connection_budget: Max DB connections for this recall (default 1 for internal ops)
         max_chunk_tokens: Maximum tokens for raw source chunk text (default 1000)
         fact_types: Optional filter for fact types to retrieve. Defaults to ["experience", "world"].
@@ -406,7 +412,7 @@ async def tool_expand(
     from ..memories import get_memories
 
     _store = get_memories()
-    if _store.writes_memory_rows_in_sql:
+    if _store.writes_memory_rows_in_sql_for(bank_id):
         memories = await conn.fetch(
             f"""
             SELECT id, text, chunk_id, document_id, fact_type, context

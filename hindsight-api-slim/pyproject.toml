@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hindsight-api-slim"
-version = "0.9.0"
+version = "0.9.1"
 description = "Hindsight: Agent Memory That Works Like Human Memory"
 license = "MIT"
 readme = "README.md"
@@ -49,7 +49,7 @@ dependencies = [
     "opentelemetry-exporter-prometheus>=0.65b0",
     "opentelemetry-exporter-otlp-proto-http>=1.44.0",
     "opentelemetry-semantic-conventions>=0.65b0",
-    "dateparser>=1.2.2",
+    "dateparser>=1.4.2",
     "google-genai>=1.0.0",
     "google-auth>=2.0.0",
     "anthropic>=0.40.0",

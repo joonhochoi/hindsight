@@ -283,15 +283,15 @@ class TestDeltaRefreshPlumbing:
         patch_llm_call,
         monkeypatch,
     ):
-        """A successful no-op refresh advances ``last_refreshed_at`` to the newest
-        in-scope memory it actually saw — not ``now()``.
+        """A successful no-op refresh advances ``last_memory_seen_at`` to the newest
+        in-scope memory it actually saw — not ``now()`` — and records that it ran by
+        stamping ``last_refreshed_at``.
 
-        The scheduled-refresh gate uses ``last_refreshed_at`` as its watermark. If a
-        no-op refresh left it unchanged, one unrelated memory would make every
-        maintenance tick submit another LLM refresh forever. Anchoring the watermark to
-        the newest processed memory stops that storm without jumping ahead of the real
-        data, so a row that commits later stays newer than the watermark (see
-        ``test_delta_refresh_watermark_survives_straddling_commit``).
+        The scheduled-refresh gate keys off the watermark. If a no-op refresh left it
+        unchanged, one unrelated memory would make every maintenance tick submit another
+        LLM refresh forever. Anchoring it to the newest processed memory stops that storm
+        without jumping ahead of the real data, so a row that commits later stays newer
+        than the watermark (see ``test_delta_refresh_watermark_survives_straddling_commit``).
         """
         bank_id = f"test-delta-watermark-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id, request_context=request_context)
@@ -333,7 +333,8 @@ class TestDeltaRefreshPlumbing:
                 bank_id,
             )
             stale_row = await conn.fetchrow(
-                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                "SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                "FROM mental_models WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mm["id"],
             )
@@ -361,12 +362,14 @@ class TestDeltaRefreshPlumbing:
 
         async with memory._pool.acquire() as conn:
             mm_row = await conn.fetchrow(
-                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                "SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                "FROM mental_models WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mm["id"],
             )
             assert mm_row is not None
-            after = mm_row["last_refreshed_at"]
+            after = mm_row["last_memory_seen_at"]
+            refreshed_at = mm_row["last_refreshed_at"]
             is_stale = await memory.compute_mental_model_is_stale(conn, bank_id, mm_row)
             history_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM mental_model_history WHERE bank_id = $1 AND mental_model_id = $2",
@@ -377,6 +380,8 @@ class TestDeltaRefreshPlumbing:
         # updated_at, not now() — so the settled window no longer re-triggers.
         assert after == fact_updated_at
         assert after > before
+        # The refresh ran, so the wall clock says so even though nothing was written.
+        assert refreshed_at > before
         assert is_stale is False
         assert history_count == 0
 
@@ -507,7 +512,8 @@ class TestDeltaRefreshPlumbing:
 
         async with memory._pool.acquire() as conn:
             mm_row = await conn.fetchrow(
-                "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
+                "SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
+                "FROM mental_models WHERE bank_id = $1 AND id = $2",
                 bank_id,
                 mm["id"],
             )
@@ -517,7 +523,7 @@ class TestDeltaRefreshPlumbing:
                 straddle_fact_id,
             )
             assert mm_row is not None
-            after = mm_row["last_refreshed_at"]
+            after = mm_row["last_memory_seen_at"]
             # Watermark advanced only to the committed baseline the refresh actually saw.
             assert after == baseline_updated_at
             # The straddler was stamped before the cutoff (an exact-cutoff/now() watermark
@@ -609,6 +615,86 @@ class TestDeltaRefreshPlumbing:
         assert len(applied) == 1
         assert applied[0]["op"] == "append_block"
         assert applied[0]["section_id"] == "members"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_delta_call_is_traced_and_uses_decoupled_completion_cap(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+        monkeypatch,
+    ):
+        """The structured-delta call is attributed to the refresh trace and its
+        transport cap is the decoupled config, not the document budget (#3421).
+
+        Two regressions in one assertion set:
+
+        - Tracing: the delta call used to run on the raw ``_reflect_llm_config``
+          outside any trace context, so its LLM calls were never written to the
+          trace table — the blind spot that made delta parse failures impossible
+          to diagnose. It must now run inside a ``mental_model_delta_ops`` trace
+          bound to the bank + mental model.
+        - Completion cap: passing the document-sized ``delta_max_tokens`` as the
+          provider's ``max_completion_tokens`` truncated the ops JSON on thinking
+          models (reasoning tokens eat the budget), which at temperature 0 fails
+          the parse deterministically forever. The transport cap must be the
+          decoupled ``reflect_max_completion_tokens`` (uncapped by default),
+          exactly as reflect's synthesis (#3365/#3389).
+        """
+        from hindsight_api.config import get_config
+        from hindsight_api.engine.llm_trace import current_trace_context
+        from hindsight_api.engine.reflect.delta_ops import DeltaOperationList
+
+        bank_id = f"test-delta-trace-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id, request_context=request_context)
+
+        existing = "# Team\n\nAlice is the lead.\n\n## Members\n\n- Alice — lead\n"
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Team Info",
+            source_query="Tell me about the team",
+            content=existing,
+            trigger={"mode": "delta"},
+            request_context=request_context,
+        )
+
+        # Seed the tracking column (zero ops → no change).
+        patch_reflect(memory, text="ignored — full mode candidate")
+
+        captured: dict[str, Any] = {}
+
+        async def capturing_call(*, messages, **kwargs):
+            ctx = current_trace_context()
+            captured["max_completion_tokens"] = kwargs.get("max_completion_tokens")
+            captured["scope"] = kwargs.get("scope")
+            captured["trace_operation"] = ctx.operation if ctx else None
+            captured["trace_bank_id"] = ctx.bank_id if ctx else None
+            captured["trace_metadata"] = dict(ctx.metadata) if ctx else None
+            return DeltaOperationList()
+
+        # First (seeding) refresh — value captured here is overwritten by the second.
+        monkeypatch.setattr(memory._reflect_llm_config, "call", capturing_call)
+        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+
+        # Second refresh with a genuine new fact so the delta call actually fires.
+        patch_reflect(
+            memory,
+            text="Alice is the lead. Bob joined.",
+            facts=[{"id": "obs-bob", "text": "Bob joined the team", "type": "observation", "context": None}],
+        )
+        captured.clear()
+        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+
+        assert captured["scope"] == "mental_model_delta_ops"
+        # Transport cap is the decoupled config (None by default), NOT delta_max_tokens
+        # (which would be max(2048, 2048*1.5) == 3072 for the default document budget).
+        assert captured["max_completion_tokens"] == get_config().reflect_max_completion_tokens
+        assert captured["max_completion_tokens"] != 3072
+        # The call ran inside a trace bound to this refresh.
+        assert captured["trace_operation"] == "mental_model_delta_ops"
+        assert captured["trace_bank_id"] == bank_id
+        assert captured["trace_metadata"] == {"mental_model_id": str(mm["id"])}
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -796,6 +882,7 @@ class TestDeltaRefreshPlumbing:
         )
         seeded_content = seeded["content"]
         seeded_refreshed_at = seeded["last_refreshed_at"]
+        seeded_memory_seen_at = seeded["last_memory_seen_at"]
 
         # Second refresh: the delta LLM call raises. The candidate is deliberately
         # a plausible-looking document — the danger is that it *is* non-empty, so
@@ -825,8 +912,9 @@ class TestDeltaRefreshPlumbing:
         assert preserved["content"] == seeded_content, (
             "Delta failure overwrote the document with the narrow-window candidate (#3112)"
         )
-        # The watermark must not move: the new fact has to stay inside the window
-        # the retry reads, or it is lost for good.
+        # Neither timestamp moves: the new fact has to stay inside the window the retry
+        # reads, or it is lost for good, and no refresh finished to record.
+        assert preserved["last_memory_seen_at"] == seeded_memory_seen_at
         assert preserved["last_refreshed_at"] == seeded_refreshed_at
         rr = preserved.get("reflect_response") or {}
         assert rr.get("refresh_skipped") == "delta_ops_failed"

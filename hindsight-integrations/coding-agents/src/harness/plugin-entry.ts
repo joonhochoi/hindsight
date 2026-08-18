@@ -44,7 +44,11 @@ export function createPluginEntry(harness: string): Plugin {
     let cfg = loadConfig({ harness });
     if (cfg.disabled) return {}; // inert: same agent, no memory (baseline parity)
 
-    const resolved = applyBankConfig(cfg, deriveBankId(cfg, projectDir || process.cwd(), harness));
+    const resolved = applyBankConfig(
+      cfg,
+      deriveBankId(cfg, projectDir || process.cwd(), harness),
+      projectDir || process.cwd()
+    );
     cfg = resolved.cfg;
     const bankId = resolved.bankId;
     if (cfg.disabled) return {}; // per-bank opt-out (banks.<id> override)
@@ -52,6 +56,7 @@ export function createPluginEntry(harness: string): Plugin {
       apiUrl: cfg.apiUrl,
       apiToken: cfg.apiToken,
       bank: bankId,
+      maxParallelRetains: cfg.maxParallelRetains,
     });
     const core = new RuntimeCore(client, bankId, cfg, harness, projectDir || process.cwd());
     // Visible presence via the host's own notice API (POST /tui/show-toast) — never stderr, which

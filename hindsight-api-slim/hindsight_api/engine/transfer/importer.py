@@ -532,6 +532,16 @@ async def import_bank(
                 if "bank_id" in row:
                     row["bank_id"] = bank_id
 
+    # `internal_id` is a globally-unique (banks_internal_id_unique) local identifier
+    # used only for per-bank index naming — it is NOT part of the bank's logical
+    # state and nothing in the archive references it. Drop it so the column DEFAULT
+    # (gen_random_uuid) mints a fresh one on insert. Keeping the source value makes
+    # the banks INSERT collide with the source bank on a same-instance re-import,
+    # where `ON CONFLICT DO NOTHING` then silently skips the parent row and every
+    # child (mental_models, …) trips its bank_id foreign key. See #3270.
+    for row in parsed.bank_rows.get("banks", []):
+        row.pop("internal_id", None)
+
     async with acquire_with_retry(backend) as conn:
         # Refuse to import into an existing bank — this restores a whole bank, it
         # does not merge. Merging would silently mix the archive's config/mental
@@ -855,6 +865,11 @@ async def _restore_fact_lifecycle(
     when present (mirroring the document-row handling); ``consolidated_at`` /
     ``consolidation_failed_at`` are set verbatim — a source-``NULL`` (unconsolidated)
     fact stays eligible, which is correct.
+
+    No ``updated_at`` stamp (see :data:`~..memories.base.META_UPDATED_AT`): this fixup
+    runs in the same transaction as the insert that created the row, so the column
+    already carries this transaction's timestamp. The same holds for the observation
+    fixups below.
     """
     rows: list[tuple[uuid.UUID, datetime | None, datetime | None, datetime | None]] = []
     for original_index, fact in enumerate(facts):

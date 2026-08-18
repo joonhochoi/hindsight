@@ -58,18 +58,29 @@ async def pool(backend):
 
 @pytest_asyncio.fixture
 async def clean_operations(pool):
-    """Clean up async_operations table before and after tests.
+    """Clean up this file's async_operations rows before and after each test.
 
-    We must clean ALL pending operations (not just test-worker-* prefixed ones)
-    because WorkerPoller.claim_batch scans the entire schema for pending tasks.
-    Stale operations left by other tests (e.g. consolidation) cause spurious
-    failures when the poller picks them up unexpectedly.
+    Scoped to the worker-test bank prefixes. This used to be a global
+    ``DELETE FROM async_operations WHERE status = 'pending'`` to keep the
+    whole-schema ``WorkerPoller.claim_batch`` from picking up rows other tests
+    left behind — but under pytest-xdist this file shares the ``public`` schema
+    with every test running in parallel, so that global delete removed *other
+    workers'* in-flight operations mid-run. A refresh op, for instance, sits
+    ``pending`` for the brief window between ``_submit_async_operation``
+    committing it and ``SyncTaskBackend`` marking it ``completed``; deleting it
+    in that window makes ``get_operation_status`` read back ``not_found`` and
+    flakes an unrelated test.
+
+    The claim tests here don't need a globally empty table: they filter claims to
+    their own bank or assert only against ``max_slots``, so foreign pending rows
+    are harmless. (The claim-*serialisation* tests, which do need an exact view,
+    isolate themselves in a private schema instead — see
+    test_graph_maintenance_claim_serialization.py.)
     """
-    await pool.execute("DELETE FROM async_operations WHERE status = 'pending'")
+    scoped_delete = "DELETE FROM async_operations WHERE bank_id LIKE 'test-worker-%' OR bank_id LIKE 'test_worker_%'"
+    await pool.execute(scoped_delete)
     yield
-    await pool.execute(
-        "DELETE FROM async_operations WHERE bank_id LIKE 'test-worker-%' OR bank_id LIKE 'test_worker_%'"
-    )
+    await pool.execute(scoped_delete)
 
 
 def test_metric_operation_label_normalises_retain_variants():
@@ -3522,7 +3533,7 @@ class TestClaimBatchRotation:
 
         serviced: list[str] = []
 
-        async def fake_claim(schema, reserved_limits, shared_limit):
+        async def fake_claim(conn, schema, reserved_limits, shared_limit):
             # Tests only exercise non-reserved ("test") tasks, so we only
             # consult the shared_limit.
             remaining = pending_per_schema.get(schema, 0)
@@ -3544,7 +3555,7 @@ class TestClaimBatchRotation:
 
         poller._claim_batch_for_schema = fake_claim  # type: ignore[method-assign]
 
-        async def fake_scan(scan_schemas):
+        async def fake_scan(conn, scan_schemas):
             return {s for s in scan_schemas if pending_per_schema.get(s, 0) > 0}
 
         poller._scan_active_schemas = fake_scan  # type: ignore[method-assign]
@@ -3656,7 +3667,8 @@ class TestClaimBatchRotation:
         )
 
         try:
-            result = await poller._scan_active_schemas([None])
+            async with backend.acquire() as conn:
+                result = await poller._scan_active_schemas(conn, [None])
             assert None in result, "Scan missed schema with pending work"
         finally:
             await pool.execute("DELETE FROM async_operations WHERE operation_id = $1", op_id)
@@ -3705,7 +3717,8 @@ class TestClaimBatchRotation:
             PostgresConnection.fetch = spy_fetch  # type: ignore[method-assign]
             PostgresConnection.fetchval = spy_fetchval  # type: ignore[method-assign]
             try:
-                await poller._scan_active_schemas([None])
+                async with backend.acquire() as conn:
+                    await poller._scan_active_schemas(conn, [None])
             finally:
                 PostgresConnection.fetch = original_fetch  # type: ignore[method-assign]
                 PostgresConnection.fetchval = original_fetchval  # type: ignore[method-assign]
@@ -3747,7 +3760,8 @@ class TestClaimBatchRotation:
                 executor=lambda x: None,
             )
 
-            result = await poller._scan_active_schemas([None])
+            async with backend.acquire() as conn:
+                result = await poller._scan_active_schemas(conn, [None])
 
             assert result == {None}
         finally:
@@ -3781,9 +3795,9 @@ class TestClaimBatchRotation:
         )
         original_claim = poller._claim_batch_for_schema
 
-        async def tracking_claim(schema, nc_limit, cons_limit):
+        async def tracking_claim(conn, schema, nc_limit, cons_limit):
             schemas_claimed.append(schema)
-            return await original_claim(schema, nc_limit, cons_limit)
+            return await original_claim(conn, schema, nc_limit, cons_limit)
 
         poller._claim_batch_for_schema = tracking_claim  # type: ignore[method-assign]
 

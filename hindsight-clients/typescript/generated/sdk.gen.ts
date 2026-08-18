@@ -855,7 +855,7 @@ export const deleteKnowledgeNode = <ThrowOnError extends boolean = false>(
 /**
  * Rename/move a knowledge-base node or update a page's options
  *
- * Rename a node (set `name`), move it under another folder (set `parent_id`, null for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`). Changing `source_query` schedules an async refresh so the page rebuilds against the new question.
+ * Rename a node (set `name`), move it under another folder (set `parent_id`, null for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`, `trigger`). Changing `source_query` schedules an async refresh so the page rebuilds against the new question. `trigger` is applied as a patch: the fields you send are updated and the rest keep the page's current values.
  */
 export const updateKnowledgeNode = <ThrowOnError extends boolean = false>(
   options: Options<UpdateKnowledgeNodeData, ThrowOnError>
@@ -876,7 +876,7 @@ export const updateKnowledgeNode = <ThrowOnError extends boolean = false>(
 /**
  * List directives
  *
- * List hard rules that are injected into prompts.
+ * List directive definitions. Unlike reflect, an omitted tag filter returns all directives.
  */
 export const listDirectives = <ThrowOnError extends boolean = false>(
   options: Options<ListDirectivesData, ThrowOnError>
@@ -889,7 +889,7 @@ export const listDirectives = <ThrowOnError extends boolean = false>(
 /**
  * Create directive
  *
- * Create a hard rule that will be injected into prompts.
+ * Create a global or tag-scoped hard rule for reflect prompts.
  */
 export const createDirective = <ThrowOnError extends boolean = false>(
   options: Options<CreateDirectiveData, ThrowOnError>
@@ -1431,7 +1431,7 @@ export const getBankConfig = <ThrowOnError extends boolean = false>(
 /**
  * Update bank configuration
  *
- * Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).
+ * Update configuration overrides for a bank. Only hierarchical behavioral settings can be overridden (retention parameters, recall settings, etc.). Keys can be provided in Python field format (retain_extraction_mode) or environment variable format (HINDSIGHT_API_RETAIN_EXTRACTION_MODE).
  */
 export const updateBankConfig = <ThrowOnError extends boolean = false>(
   options: Options<UpdateBankConfigData, ThrowOnError>

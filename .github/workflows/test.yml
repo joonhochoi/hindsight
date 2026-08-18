@@ -32,6 +32,7 @@ jobs:
       integration-tests: ${{ steps.filter.outputs.integration-tests }}
       integrations-openclaw: ${{ steps.filter.outputs.integrations-openclaw }}
       integrations-ai-sdk: ${{ steps.filter.outputs.integrations-ai-sdk }}
+      integrations-eliza: ${{ steps.filter.outputs.integrations-eliza }}
       integrations-agent-framework: ${{ steps.filter.outputs.integrations-agent-framework }}
       integrations-composio: ${{ steps.filter.outputs.integrations-composio }}
       integrations-chat: ${{ steps.filter.outputs.integrations-chat }}
@@ -43,6 +44,7 @@ jobs:
       integrations-continue: ${{ steps.filter.outputs.integrations-continue }}
       integrations-cursor-cli: ${{ steps.filter.outputs.integrations-cursor-cli }}
       integrations-zcode: ${{ steps.filter.outputs.integrations-zcode }}
+      integrations-agent-plugin: ${{ steps.filter.outputs.integrations-agent-plugin }}
       integrations-copilot-cli: ${{ steps.filter.outputs.integrations-copilot-cli }}
       integrations-crewai: ${{ steps.filter.outputs.integrations-crewai }}
       integrations-litellm: ${{ steps.filter.outputs.integrations-litellm }}
@@ -142,6 +144,8 @@ jobs:
             - 'hindsight-integrations/openclaw/**'
           integrations-ai-sdk:
             - 'hindsight-integrations/ai-sdk/**'
+          integrations-eliza:
+            - 'hindsight-integrations/eliza/**'
           integrations-agent-framework:
             - 'hindsight-integrations/agent-framework/**'
           integrations-composio:
@@ -194,6 +198,8 @@ jobs:
             - 'hindsight-integrations/zed/**'
           integrations-zcode:
             - 'hindsight-integrations/zcode/**'
+          integrations-agent-plugin:
+            - 'hindsight-integrations/agent-plugin/**'
           integrations-n8n:
             - 'hindsight-integrations/n8n/**'
           integrations-zapier:
@@ -796,6 +802,29 @@ jobs:
       working-directory: ./hindsight-integrations/zcode
       run: uv run pytest tests -v
 
+  test-agent-plugin-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-agent-plugin == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Validate Agent Plugin manifests
+      working-directory: ./hindsight-integrations/agent-plugin
+      run: python3 validate.py
+
   build-ai-sdk-integration:
     needs: [detect-changes]
     if: >-
@@ -858,6 +887,37 @@ jobs:
     - name: Run tests (Deno)
       working-directory: ./hindsight-integrations/ai-sdk
       run: npm run test:deno
+
+  build-eliza-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-eliza == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/eliza
+      run: npm ci
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/eliza
+      run: npm test
+
+    - name: Build
+      working-directory: ./hindsight-integrations/eliza
+      run: npm run build
 
   test-opencode-integration:
     needs: [detect-changes]
@@ -1394,6 +1454,30 @@ jobs:
           ~/.cargo/git
           hindsight-cli/target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install cargo-about
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-about@0.9.1
+
+    - name: Verify cargo-about
+      run: cargo about --version
+
+    # cargo-about resolves the dependency graph for every target platform, so it
+    # needs crates this host never builds (e.g. the Android-only
+    # android_system_properties). Populate the registry first: `cargo fetch`
+    # without --target downloads for all targets, and Cargo.lock is not checked
+    # in, so nothing is cached from a previous step.
+    - name: Fetch crate sources for the license scan
+      working-directory: hindsight-cli
+      run: cargo fetch
+
+    - name: Generate and verify license manifest
+      working-directory: hindsight-cli
+      run: |
+        cargo about generate --offline --manifest-path Cargo.toml --config about.toml about.hbs --output-file /tmp/THIRD_PARTY_LICENSES.txt
+        test -s /tmp/THIRD_PARTY_LICENSES.txt
+        grep -Fq "THIRD-PARTY SOFTWARE LICENSES" /tmp/THIRD_PARTY_LICENSES.txt
 
     - name: Run unit tests
       working-directory: hindsight-cli
@@ -4560,6 +4644,8 @@ jobs:
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
     - uses: actions/checkout@v6
@@ -4584,6 +4670,8 @@ jobs:
           ${{ runner.os }}-huggingface-
 
     - name: Run Hermes compatibility test
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
       run: ./scripts/test-hermes-compat.sh
 
     - name: Collect embedded daemon logs on failure
@@ -5217,6 +5305,7 @@ jobs:
       - test-codex-integration
       - test-cursor-cli-integration
       - test-zcode-integration
+      - test-agent-plugin-integration
       - build-ai-sdk-integration
       - test-ai-sdk-integration-deno
       - test-opencode-integration

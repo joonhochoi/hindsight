@@ -12,11 +12,13 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any, NoReturn
 
 import pytest
 import pytest_asyncio
 
 from hindsight_api import MemoryEngine, RequestContext
+from hindsight_api.engine.db import DatabaseConnection
 from hindsight_api.engine.memory_engine import Budget
 
 pytestmark = pytest.mark.oracle
@@ -836,7 +838,8 @@ class TestAdvancedFeatures:
 
             # List
             models = await oracle_memory.list_mental_models(bank_id=bank_id, request_context=request_context)
-            assert len(models) > 0
+            assert models.total > 0
+            assert len(models.items) > 0
 
             # Get
             fetched = await oracle_memory.get_mental_model(
@@ -873,6 +876,36 @@ class TestAdvancedFeatures:
                 request_context=request_context,
             )
             assert deleted is None
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+    @pytest.mark.asyncio
+    async def test_knowledge_page_failure_rolls_back_mental_model(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext, monkeypatch
+    ):
+        bank_id = _bank_id("kb-rollback")
+        mental_model_id = f"mm-{uuid.uuid4().hex}"
+        insert_mental_model = oracle_memory._insert_pinned_mental_model
+
+        async def insert_then_fail(conn: DatabaseConnection, **kwargs: Any) -> NoReturn:
+            await insert_mental_model(conn, **kwargs)
+            raise RuntimeError("page write failed")
+
+        monkeypatch.setattr(oracle_memory, "_insert_pinned_mental_model", insert_then_fail)
+        try:
+            with pytest.raises(RuntimeError, match="page write failed"):
+                await oracle_memory.create_knowledge_page(
+                    bank_id,
+                    "Rolled back",
+                    "What is rolled back?",
+                    "seed",
+                    mental_model_id=mental_model_id,
+                    request_context=request_context,
+                )
+
+            assert (
+                await oracle_memory.get_mental_model(bank_id, mental_model_id, request_context=request_context) is None
+            )
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
@@ -958,7 +991,8 @@ class TestAdvancedFeatures:
             assert directive is not None
 
             directives = await oracle_memory.list_directives(bank_id=bank_id, request_context=request_context)
-            assert len(directives) > 0
+            assert directives.total > 0
+            assert len(directives.items) > 0
 
             await oracle_memory.delete_directive(
                 bank_id=bank_id,
